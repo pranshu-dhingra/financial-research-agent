@@ -304,9 +304,7 @@ def extract_text_from_pdf(path, max_pages=MAX_PAGES):
             texts.append(page.extract_text() or "")
         except Exception:
             texts.append("")
-    return "
-
-".join(texts)
+    return "".join(texts)
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP, max_chunks=MAX_CHUNKS):
@@ -402,11 +400,11 @@ def _parse_model_text(raw_str):
             if isinstance(out, list):
                 return "\n".join([str(x).strip() for x in out]).strip()
         
-        # Check common text fields
+        # Check common text fields (only return if value is non-empty)
         for key in ["text", "content", "answer", "response"]:
             if key in parsed:
                 val = parsed[key]
-                if isinstance(val, str):
+                if isinstance(val, str) and val.strip():
                     return val.strip()
                 elif isinstance(val, (dict, list)):
                     # Nested structure, try to extract text
