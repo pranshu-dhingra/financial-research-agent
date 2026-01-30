@@ -38,6 +38,11 @@ TOOL_KNOWLEDGE_BASE = {
         "purpose": "Company metrics, balance sheets, ratios",
         "example_providers": ["Yahoo Finance", "Alpha Vantage"],
     },
+    "market_prices": {
+        "category": "market",
+        "purpose": "Real-time and historical market prices",
+        "example_providers": ["Yahoo Finance", "Alpha Vantage", "NSE", "BSE"],
+    },
     "macroeconomic": {
         "category": "macro",
         "purpose": "GDP, inflation, policy rates",
