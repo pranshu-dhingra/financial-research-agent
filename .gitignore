@@ -1,0 +1,12 @@
+# Credentials (secrets)
+.tool_credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/

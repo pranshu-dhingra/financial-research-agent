@@ -1,0 +1,14 @@
+{
+  "providers": {
+    "serpapi": {
+      "category": "generic",
+      "endpoint_template": "https://api.serpapi.com/search?q={q}&api_key={api_key}",
+      "required_fields": ["api_key"]
+    },
+    "web_search_generic": {
+      "category": "generic",
+      "endpoint_template": "",
+      "required_fields": []
+    }
+  }
+}

@@ -19,6 +19,7 @@ Environment variables:
   AWS_REGION (default: us-east-1)
   CHUNK_SIZE, CHUNK_OVERLAP, MAX_PAGES, MAX_CHUNKS
   DEBUG=1, SAVE_MEMORY=1, MAX_MEMORY_TO_LOAD
+  ENABLE_TOOL_PLANNER=1 - augment with BFSI external search (see tools.py)
 """
 
 import sys
@@ -56,6 +57,7 @@ SAVE_MEMORY = os.environ.get("SAVE_MEMORY", "1") != "0"
 MAX_MEMORY_TO_LOAD = int(os.environ.get("MAX_MEMORY_TO_LOAD", 5))
 
 DEBUG = os.environ.get("DEBUG", "0") == "1"
+ENABLE_TOOL_PLANNER = os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1"
 
 MEMORY_DIR = Path("memories")
 MEMORY_DIR.mkdir(exist_ok=True)
@@ -349,13 +351,14 @@ def make_chunk_prompt(chunk, question, idx, total):
     )
 
 
-def make_synthesis_prompt(partials, question, prior_memory_text=None):
+def make_synthesis_prompt(partials, question, prior_memory_text=None, external_context=None):
     joined = "\n\n".join(f"PARTIAL {i+1}: {p}" for i, p in enumerate(partials))
     mem = f"PAST INTERACTIONS:\n{prior_memory_text}\n\n" if prior_memory_text else ""
+    ext = f"EXTERNAL CONTEXT (live data):\n{external_context}\n\n" if external_context else ""
     return (
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
         "You are a senior researcher combining partial answers into one clear answer.\n\n"
-        f"{mem}PARTIAL ANSWERS:\n{joined}\n\n"
+        f"{mem}{ext}PARTIAL ANSWERS:\n{joined}\n\n"
         "INSTRUCTIONS:\n"
         "- Merge into one final answer. If partials disagree, explain uncertainty.\n"
         "- If none contain an answer, say 'Not found in document'.\n"
@@ -389,6 +392,20 @@ def main():
         print(f"Found {len(relevant)} relevant past interaction(s).")
     prior_mem_text = "\n".join(f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant) if relevant else None
 
+    external_context = None
+    if ENABLE_TOOL_PLANNER:
+        try:
+            import tools
+            print("Tool planner: checking external sources...")
+            external_context = tools.run_external_search(question, call_llm_fn=call_bedrock)
+            if external_context and external_context.strip():
+                print("External context retrieved.")
+        except ImportError:
+            pass
+        except Exception as e:
+            if DEBUG:
+                print(f"[DEBUG] tool planner failed: {e}")
+
     print("Extracting text from PDF...")
     doc_text = extract_text_from_pdf(pdf_path)
     partials = []
@@ -411,11 +428,22 @@ def main():
             partials.append(resp_text)
 
         if not partials:
-            final_answer = "Not found in document"
+            if external_context and external_context.strip():
+                print("Synthesizing from external context...")
+                final_answer = call_bedrock_stream(
+                    make_synthesis_prompt(
+                        [external_context], question, prior_mem_text,
+                        external_context=None
+                    )
+                )
+                if not (final_answer or final_answer.strip()):
+                    final_answer = "Not found in document"
+            else:
+                final_answer = "Not found in document"
         else:
             print("Synthesizing final answer...")
             final_answer = call_bedrock_stream(
-                make_synthesis_prompt(partials, question, prior_mem_text)
+                make_synthesis_prompt(partials, question, prior_mem_text, external_context)
             )
             if not (final_answer or final_answer.strip()):
                 final_answer = "Not found in document"
