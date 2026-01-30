@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
 """
 local_pdf_qa.py
-An improved PDF Q&A script that adds chunking (with overlap), a two-pass
-reasoning flow, streaming support (separate function), and semantic memory
-using embeddings (Bedrock) + Annoy vector index for relevance search.
+PDF Q&A with chunking, two-pass reasoning, streaming, and semantic memory
+(embeddings + Annoy vector index).
+
+Verification (per-PDF memory):
+  Run twice on two different PDFs and verify:
+  - memories/ contains two separate files.
+  - Re-running same PDF appends to same file.
 
 Usage:
-  1) Install additional dependencies: pip install -r requirements_add.txt
-  2) Set MODEL_ID and EMBEDDING_MODEL_ID (or rely on defaults). Optionally set AWS_REGION.
-  3) python local_pdf_qa.py path/to/file.pdf "Your question here"
+  pip install -r requirements.txt
+  python local_pdf_qa.py path/to/file.pdf "Your question here"
 
-Environment variables (optional):
+Environment variables:
   MODEL_ID (default: meta.llama3-3-70b-instruct-v1:0)
   EMBEDDING_MODEL_ID (default: amazon.titan-embed-text-v1)
   AWS_REGION (default: us-east-1)
   CHUNK_SIZE, CHUNK_OVERLAP, MAX_PAGES, MAX_CHUNKS
-  DEBUG=1 to enable debug prints
-  SAVE_MEMORY=1 (default) to enable saving memory to memory.json
-  MEMORY_FILE to override default memory filename
-
-Notes:
- - Keep your AWS credentials configured (aws configure) so boto3 can read them.
- - The streaming call uses `invoke_model_with_response_stream` when available.
- - Semantic memory uses Annoy for approximate nearest neighbor search.
- - Falls back to token-overlap relevance if embeddings/Annoy unavailable.
- - Memory entries include embeddings for semantic search; older entries without
-   embeddings are skipped in vector index but still loaded.
+  DEBUG=1, SAVE_MEMORY=1, MAX_MEMORY_TO_LOAD
 """
 
 import sys
@@ -33,180 +26,144 @@ import os
 import json
 import math
 import uuid
+import hashlib
 from datetime import datetime
+from pathlib import Path
 from PyPDF2 import PdfReader
 import boto3
 
-# Additional dependencies for semantic memory (install via: pip install -r requirements_add.txt)
 try:
     import annoy
     import numpy as np
     HAS_ANNOY = True
 except ImportError:
     HAS_ANNOY = False
-    # DEBUG will be checked later when needed
 
 # --- Configuration ---
-MODEL_ID = os.environ.get("MODEL_ID", "meta.llama3-3-70b-instruct-v1:0")
+# Use inference profile ID (required for Llama 3.3 70B on-demand in us-east-1)
+MODEL_ID = os.environ.get("MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0")
 REGION = os.environ.get("AWS_REGION", "us-east-1")
-PROFILE = os.environ.get("AWS_PROFILE", None)  # optional
 
-# Chunking parameters (tune these)
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1200))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 200))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", 20))
-MAX_CHUNKS = int(os.environ.get("MAX_CHUNKS", 60))  # safety cap to avoid floods
+MAX_CHUNKS = int(os.environ.get("MAX_CHUNKS", 60))
 
-# Model generation defaults (tune by model)
 LLAMA_MAX_GEN = int(os.environ.get("LLAMA_MAX_GEN", 800))
 CLAUDE_MAX_TOKENS = int(os.environ.get("CLAUDE_MAX_TOKENS", 800))
 
-# Memory
 SAVE_MEMORY = os.environ.get("SAVE_MEMORY", "1") != "0"
-MEMORY_FILE = os.environ.get("MEMORY_FILE", "memory.json")
 MAX_MEMORY_TO_LOAD = int(os.environ.get("MAX_MEMORY_TO_LOAD", 5))
 
-# Debugging
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 
+MEMORY_DIR = Path("memories")
+MEMORY_DIR.mkdir(exist_ok=True)
 
-# --- Helpers: embeddings ---
+
+# --- Embeddings ---
 
 def get_embedding(text, model_id=None, region=REGION):
-    """
-    Get embedding vector for text using Bedrock embedding model.
-    Returns L2-normalized vector (list of floats) or None on error.
-    """
+    """Get L2-normalized embedding vector from Bedrock. Returns None on error."""
     if model_id is None:
         model_id = os.environ.get("EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v1")
-    
     if not text or not text.strip():
-        if DEBUG:
-            print("[DEBUG] get_embedding: empty text provided")
         return None
-    
     try:
         client = boto3.client("bedrock-runtime", region_name=region)
-        # Amazon Titan embedding model expects {"inputText": text}
-        # Note: Some embedding models may use different request shapes; adjust if needed
-        request_body = json.dumps({"inputText": text})
-        
         response = client.invoke_model(
             modelId=model_id,
             contentType="application/json",
             accept="application/json",
-            body=request_body
+            body=json.dumps({"inputText": text}),
         )
-        
-        raw_str = _read_response_body(response)
-        parsed = json.loads(raw_str)
-        
-        # Extract embedding vector - Titan returns {"embedding": [floats]}
-        embedding = None
-        if isinstance(parsed, dict):
-            if "embedding" in parsed:
-                embedding = parsed["embedding"]
-            elif "vector" in parsed:
-                embedding = parsed["vector"]
-            else:
-                # Try to find first list of numbers
-                for key, value in parsed.items():
-                    if isinstance(value, list) and len(value) > 0 and isinstance(value[0], (int, float)):
-                        embedding = value
-                        break
-        
-        if embedding is None:
-            if DEBUG:
-                print(f"[DEBUG] get_embedding: could not extract embedding from response: {parsed}")
+        raw = response["body"].read().decode("utf-8")
+        parsed = json.loads(raw)
+        emb = parsed.get("embedding")
+        if not emb or not isinstance(emb, list):
             return None
-        
-        # Convert to list of floats and L2 normalize
-        if not HAS_ANNOY:
-            # Manual normalization without numpy
-            vec = [float(x) for x in embedding]
-            norm = math.sqrt(sum(x * x for x in vec))
+        if HAS_ANNOY:
+            vec = np.array(emb, dtype=np.float32)
+            norm = np.linalg.norm(vec)
             if norm > 0:
-                vec = [x / norm for x in vec]
-            return vec
-        
-        vec = np.array(embedding, dtype=np.float32)
-        norm = np.linalg.norm(vec)
-        if norm > 0:
-            vec = vec / norm
-        return vec.tolist()
-        
+                vec = vec / norm
+            return vec.tolist()
+        vec = [float(x) for x in emb]
+        norm = math.sqrt(sum(x * x for x in vec))
+        return [x / norm for x in vec] if norm > 0 else vec
     except Exception as e:
         if DEBUG:
             print(f"[DEBUG] get_embedding failed: {e}")
         return None
 
 
-# --- Helpers: file / memory ---
+# --- Memory ---
 
-def load_memory(memory_file=MEMORY_FILE):
-    if not os.path.exists(memory_file):
+def _pdf_memory_filename(pdf_path: str) -> str:
+    """Deterministic memory filename: memories/memory_<basename>_<hash>.json"""
+    abs_path = os.path.abspath(pdf_path)
+    h = hashlib.sha256(abs_path.encode("utf-8")).hexdigest()[:10]
+    base = os.path.basename(abs_path)
+    return str(MEMORY_DIR / f"memory_{base}_{h}.json")
+
+
+def load_memory_for_pdf(pdf_path: str):
+    """Load memory list for this PDF. Returns [] if file does not exist."""
+    path = _pdf_memory_filename(pdf_path)
+    if not os.path.exists(path):
         return []
     try:
-        with open(memory_file, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, list):
-                return data
-            return []
+        return data if isinstance(data, list) else []
     except Exception as e:
         if DEBUG:
-            print(f"[DEBUG] failed to load memory file {memory_file}: {e}")
+            print(f"[DEBUG] load_memory_for_pdf failed: {e}")
         return []
 
 
-def append_memory(entry, memory_file=MEMORY_FILE):
-    mem = load_memory(memory_file)
+def append_memory_for_pdf(entry, pdf_path: str):
+    """Append entry to this PDF's memory file. Uses atomic write."""
+    path = _pdf_memory_filename(pdf_path)
+    mem = load_memory_for_pdf(pdf_path)
     mem.append(entry)
-    try:
-        with open(memory_file, "w", encoding="utf-8") as f:
-            json.dump(mem, f, ensure_ascii=False, indent=2)
-        if DEBUG:
-            print(f"[DEBUG] memory appended: {entry.get('id')}")
-    except Exception as e:
-        print(f"Warning: failed to write memory file: {e}")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(mem, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def list_all_memory_files():
+    """List paths of all memory files in MEMORY_DIR."""
+    if not MEMORY_DIR.exists():
+        return []
+    return sorted(str(p) for p in MEMORY_DIR.glob("memory_*.json"))
 
 
 def build_annoy_index(mem_list):
-    """
-    Build Annoy index from memory entries that have embeddings.
-    Returns (index, id_map) where id_map maps Annoy idx to memory list index.
-    Returns (None, None) if no embeddings found or Annoy unavailable.
-    """
+    """Build Annoy index from memories with embeddings. Returns (index, id_map) or (None, None)."""
     if not HAS_ANNOY or not mem_list:
         return None, None
-    
-    # Find first entry with embedding to detect dimension
     d = None
     for m in mem_list:
         emb = m.get("embedding")
         if emb and isinstance(emb, list) and len(emb) > 0:
             d = len(emb)
             break
-    
     if d is None:
-        if DEBUG:
-            print("[DEBUG] build_annoy_index: no embeddings found in memory")
         return None, None
-    
     try:
-        index = annoy.AnnoyIndex(d, 'angular')
-        id_map = {}  # maps Annoy idx -> memory list index
-        
+        index = annoy.AnnoyIndex(d, "angular")
+        id_map = {}
         for mem_idx, m in enumerate(mem_list):
             emb = m.get("embedding")
             if emb and isinstance(emb, list) and len(emb) == d:
-                annoy_idx = index.get_n_items()
-                index.add_item(annoy_idx, emb)
-                id_map[annoy_idx] = mem_idx
-        
+                idx = index.get_n_items()
+                index.add_item(idx, emb)
+                id_map[idx] = mem_idx
         if index.get_n_items() == 0:
             return None, None
-        
-        index.build(n_trees=10)
+        index.build(10)
         return index, id_map
     except Exception as e:
         if DEBUG:
@@ -215,436 +172,200 @@ def build_annoy_index(mem_list):
 
 
 def find_relevant_memories_semantic(question, mem_list, top_k=5, threshold=0.7, pdf_path=None):
-    """
-    Semantic search using embeddings and Annoy index.
-    Falls back to token-overlap if embeddings/index unavailable.
-    Returns list of memory entries with similarity scores.
-    """
+    """Semantic search via embeddings + Annoy. Falls back to token-overlap only if embeddings fail."""
     if not mem_list:
         return []
-    
-    # Try semantic search first
-    if HAS_ANNOY:
-        q_vec = get_embedding(question)
-        if q_vec is not None:
-            index, id_map = build_annoy_index(mem_list)
-            if index is not None and id_map:
-                try:
-                    # Get nearest neighbors (Annoy uses angular distance)
-                    annoy_ids, distances = index.get_nns_by_vector(q_vec, top_k, include_distances=True)
-                    
-                    # Convert angular distance to cosine similarity
-                    # For normalized vectors, angular distance d relates to cosine: cos = 1 - d^2/2
-                    results = []
-                    for annoy_idx, dist in zip(annoy_ids, distances):
-                        mem_idx = id_map.get(annoy_idx)
-                        if mem_idx is not None:
-                            # Angular distance to cosine similarity
-                            cos_sim = 1.0 - (dist * dist) / 2.0
-                            # Clamp to [0, 1] for safety
-                            cos_sim = max(0.0, min(1.0, cos_sim))
-                            if cos_sim >= threshold:
-                                mem_entry = mem_list[mem_idx].copy()
-                                mem_entry["_similarity"] = cos_sim
-                                results.append(mem_entry)
-                    
-                    # Sort by similarity descending
-                    results.sort(key=lambda x: x.get("_similarity", 0), reverse=True)
-                    if results:
-                        if DEBUG:
-                            print(f"[DEBUG] semantic search found {len(results)} relevant memories")
-                        return results
-                except Exception as e:
-                    if DEBUG:
-                        print(f"[DEBUG] semantic search error, falling back: {e}")
-    
-    # Fallback to token-overlap method
+    q_vec = get_embedding(question)
+    if q_vec is not None:
+        index, id_map = build_annoy_index(mem_list)
+        if index is not None and id_map:
+            try:
+                ids, dists = index.get_nns_by_vector(q_vec, top_k, include_distances=True)
+                results = []
+                for aid, d in zip(ids, dists):
+                    mem_idx = id_map.get(aid)
+                    if mem_idx is not None:
+                        cos_sim = max(0.0, min(1.0, 1.0 - (d * d) / 2.0))
+                        if cos_sim >= threshold:
+                            m = mem_list[mem_idx].copy()
+                            m["_similarity"] = cos_sim
+                            results.append(m)
+                results.sort(key=lambda x: x.get("_similarity", 0), reverse=True)
+                if results:
+                    return results
+            except Exception as e:
+                if DEBUG:
+                    print(f"[DEBUG] semantic search failed: {e}")
+    # Fallback only when embeddings/index unavailable
     if DEBUG:
-        print("[DEBUG] falling back to token-overlap relevance search")
-    return find_relevant_memories(question, pdf_path or "", mem_list, max_results=top_k)
+        print("[DEBUG] falling back to token-overlap")
+    return _find_relevant_memories_token(question, pdf_path or "", mem_list, top_k)
 
 
-def find_relevant_memories(question, pdf_path, mem_list, max_results=MAX_MEMORY_TO_LOAD):
-    """
-    Lightweight relevance: prefer exact same pdf path matches first; then simple
-    token-overlap between question and memory.question; return up to max_results.
-    """
+def _find_relevant_memories_token(question, pdf_path, mem_list, max_results):
+    """Token-overlap relevance. Used only when semantic search fails."""
     if not mem_list:
         return []
-
-    # normalize
-    q_tokens = set([w.lower() for w in question.split() if len(w) > 2])
+    q_tokens = set(w.lower() for w in question.split() if len(w) > 2)
     scored = []
     for m in mem_list:
-        score = 0
-        # exact pdf match strong signal
-        if m.get("pdf_path") and os.path.basename(m.get("pdf_path")) == os.path.basename(pdf_path):
-            score += 100
-        # token overlap
+        s = 100 if (m.get("pdf_path") and os.path.basename(m.get("pdf_path")) == os.path.basename(pdf_path)) else 0
         mq = m.get("question", "")
-        mq_tokens = set([w.lower() for w in mq.split() if len(w) > 2])
-        overlap = len(q_tokens & mq_tokens)
-        score += overlap
-        scored.append((score, m))
-
+        s += len(q_tokens & set(w.lower() for w in mq.split() if len(w) > 2))
+        scored.append((s, m))
     scored.sort(key=lambda x: x[0], reverse=True)
-    results = [m for s, m in scored if s > 0]
-    return results[:max_results]
+    return [m for s, m in scored if s > 0][:max_results]
 
 
-# --- Helpers: text extraction / chunking ---
+# --- PDF / chunking ---
 
 def extract_text_from_pdf(path, max_pages=MAX_PAGES):
     reader = PdfReader(path)
     texts = []
-    num_pages = min(len(reader.pages), max_pages)
-    for i in range(num_pages):
+    for i in range(min(len(reader.pages), max_pages)):
         try:
-            page = reader.pages[i]
-            texts.append(page.extract_text() or "")
+            texts.append(reader.pages[i].extract_text() or "")
         except Exception:
             texts.append("")
-    return "".join(texts)
+    return "\n\n".join(texts)
 
 
 def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP, max_chunks=MAX_CHUNKS):
     if not text:
         return []
-    chunks = []
-    start = 0
-    L = len(text)
+    chunks, start, L = [], 0, len(text)
     while start < L and len(chunks) < max_chunks:
         end = start + size
-        chunk = text[start:end]
-        chunks.append(chunk.strip())
-        # step forward but keep overlap
+        chunks.append(text[start:end].strip())
         start = end - overlap
         if start < 0:
             start = 0
     return chunks
 
 
-# --- Helpers: Bedrock request/response parsing ---
+# --- Bedrock: parsing (contract: {"generation": "..."}) ---
 
-def _prepare_native_request(prompt):
-    if "llama" in MODEL_ID.lower():
-        return {
-            "prompt": prompt,
-            "max_gen_len": LLAMA_MAX_GEN,
-            "temperature": 0.2,
-            "top_p": 0.95
-        }
-    elif "claude" in MODEL_ID.lower():
-        return {
-            "prompt": prompt,
-            "max_tokens_to_sample": CLAUDE_MAX_TOKENS
-        }
-    else:
-        return {"prompt": prompt}
-
-
-def _read_response_body(response):
-    raw_body = response.get("body")
-    if hasattr(raw_body, "read"):
-        raw_str = raw_body.read().decode("utf-8")
-    elif isinstance(raw_body, (bytes, bytearray)):
-        raw_str = raw_body.decode("utf-8")
-    else:
-        raw_str = str(raw_body)
-    return raw_str
-
-
-def _parse_model_text(raw_str):
-    """
-    Parse model response and extract plain text, handling JSON-wrapped responses.
-    Always returns plain text string (not JSON).
-    """
+def _parse_generation(raw_str):
+    """Extract plain text from Bedrock response. Contract: top-level {"generation": "..."}."""
     if not raw_str:
         return ""
-    
-    # Try to parse as JSON
     try:
         parsed = json.loads(raw_str)
-    except Exception:
-        # Not JSON, return as-is (already plain text)
-        return raw_str.strip()
-
-    if isinstance(parsed, dict):
-        # Check for "generation" field (common in some models)
-        if "generation" in parsed:
+        if isinstance(parsed, dict) and "generation" in parsed:
             gen = parsed["generation"]
-            if isinstance(gen, str):
-                return gen.strip()
-            elif isinstance(gen, dict):
-                if "content" in gen:
-                    return str(gen["content"]).strip()
-                if "candidates" in gen and isinstance(gen["candidates"], list):
-                    texts = [c.get("content", "") if isinstance(c, dict) else str(c) for c in gen["candidates"]]
-                    return "\n".join([t.strip() for t in texts if t]).strip()
-            elif isinstance(gen, list):
-                texts = []
-                for item in gen:
-                    if isinstance(item, dict):
-                        texts.append(item.get("content", ""))
-                    else:
-                        texts.append(str(item))
-                return "\n".join([t.strip() for t in texts if t]).strip()
-        
-        # Check for "output" field
-        if "output" in parsed:
-            out = parsed["output"]
-            if isinstance(out, str):
-                return out.strip()
-            if isinstance(out, dict):
-                return (out.get("text") or out.get("content") or "").strip()
-            if isinstance(out, list):
-                return "\n".join([str(x).strip() for x in out]).strip()
-        
-        # Check common text fields (only return if value is non-empty)
-        for key in ["text", "content", "answer", "response"]:
-            if key in parsed:
-                val = parsed[key]
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-                elif isinstance(val, (dict, list)):
-                    # Nested structure, try to extract text
-                    continue
-        
-        # If still a dict and we haven't found text, return empty or first string value
-        for val in parsed.values():
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-    
-    elif isinstance(parsed, str):
-        return parsed.strip()
-    elif isinstance(parsed, list):
-        # List of strings or objects
-        texts = [str(x).strip() for x in parsed if x]
-        return "\n".join(texts).strip()
-    
-    # Fallback: return empty string rather than JSON dump
+            return str(gen) if gen else ""  # Do not strip - preserve leading/trailing spaces
+    except json.JSONDecodeError:
+        pass
     return ""
 
 
-def call_bedrock(prompt, model_id=MODEL_ID, region=REGION):
+def _append_stream_piece(final_text, piece):
     """
-    Synchronous (non-streaming) call to Bedrock. Returns clean plain text (not JSON).
+    Append a streaming piece to accumulated text. Insert a space when joining
+    two word boundaries that Bedrock token-by-token streaming may have split
+    without a space. Conservative: only when second piece starts with uppercase
+    (new word) or first ends with sentence punctuation, to avoid splitting
+    subwords ("invigorate") or acronyms ("MSMEs").
     """
-    client = boto3.client("bedrock-runtime", region_name=region)
-    native_req = _prepare_native_request(prompt)
-    request_body = json.dumps(native_req)
+    if not piece:
+        return final_text
+    if not final_text:
+        return piece
+    last = final_text[-1]
+    first = piece[0]
+    attach_punct = ".,!?;:)\"'"
+    need_space = (
+        not last.isspace() and last not in attach_punct and
+        not first.isspace() and first not in attach_punct and
+        (first.isupper() or last in ".!?")
+    )
+    return final_text + (" " if need_space else "") + piece
 
+
+# --- Bedrock: invoke ---
+
+def _prepare_request(prompt):
+    if "llama" in MODEL_ID.lower():
+        return {"prompt": prompt, "max_gen_len": LLAMA_MAX_GEN, "temperature": 0.2, "top_p": 0.95}
+    if "claude" in MODEL_ID.lower():
+        return {"prompt": prompt, "max_tokens_to_sample": CLAUDE_MAX_TOKENS}
+    return {"prompt": prompt}
+
+
+def call_bedrock(prompt, model_id=MODEL_ID, region=REGION):
+    """Synchronous Bedrock call. Returns plain text only."""
+    client = boto3.client("bedrock-runtime", region_name=region)
     response = client.invoke_model(
         modelId=model_id,
         contentType="application/json",
         accept="application/json",
-        body=request_body
+        body=json.dumps(_prepare_request(prompt)),
     )
-
-    raw_str = _read_response_body(response)
-    if DEBUG:
-        print(f"\n[DEBUG] raw model response:\n{raw_str}\n")
-
-    parsed_text = _parse_model_text(raw_str)
-    # Ensure we return clean text, strip any remaining whitespace
-    return parsed_text.strip() if parsed_text else ""
+    raw = response["body"].read().decode("utf-8")
+    return _parse_generation(raw)
 
 
 def call_bedrock_stream(prompt, model_id=MODEL_ID, region=REGION):
-    """
-    Streaming call to Bedrock. Returns full collected clean text after streaming.
-    Extracts model-generated text from JSON-wrapped chunks and prints tokens live.
-    """
+    """Streaming Bedrock call. Contract: event["chunk"]["bytes"] -> UTF-8 JSON with generation."""
     client = boto3.client("bedrock-runtime", region_name=region)
-    native_req = _prepare_native_request(prompt)
-    request_body = json.dumps(native_req)
-
-    # Fallback: if streaming not available, use non-streaming
     if not hasattr(client, "invoke_model_with_response_stream"):
-        if DEBUG:
-            print("[DEBUG] streaming API not available on client; falling back to invoke_model")
         return call_bedrock(prompt, model_id=model_id, region=region)
-
     response = client.invoke_model_with_response_stream(
         modelId=model_id,
         contentType="application/json",
         accept="application/json",
-        body=request_body
+        body=json.dumps(_prepare_request(prompt)),
     )
-
-    stream = response.get("body")
     final_text = ""
-    json_chunks = []  # Collect JSON chunks for parsing if needed
-
-    # The stream yields events that may contain nested JSON; we try to robustly extract
-    # textual tokens. This implementation extracts text from JSON-wrapped responses.
-    try:
-        for event in stream:
-            try:
-                if isinstance(event, (bytes, bytearray)):
-                    decoded = event.decode("utf-8")
-                    json_chunks.append(decoded)
-                    # Try to parse immediately
-                    try:
-                        parsed = json.loads(decoded)
-                        text_piece = _parse_model_text(decoded)
-                        if text_piece:
-                            print(text_piece, end="", flush=True)
-                            final_text += text_piece
-                    except Exception:
-                        # Not JSON, might be raw text
-                        if decoded.strip():
-                            print(decoded, end="", flush=True)
-                            final_text += decoded
-                    continue
-                elif isinstance(event, dict):
-                    parsed = event
-                else:
-                    # Unknown type, stringify
-                    chunk_text = str(event)
-                    if chunk_text.strip():
-                        print(chunk_text, end="", flush=True)
-                        final_text += chunk_text
-                    continue
-
-                # Attempt to extract textual content from parsed event
-                text_piece = None
-                
-                # Check for nested chunk structure
-                if "chunk" in parsed and isinstance(parsed["chunk"], dict):
-                    c = parsed["chunk"]
-                    if "bytes" in c:
-                        try:
-                            decoded_bytes = c["bytes"].decode("utf-8")
-                            text_piece = _parse_model_text(decoded_bytes)
-                        except Exception:
-                            pass
-                
-                # Check for "generation" field in parsed event
-                if not text_piece and "generation" in parsed:
-                    gen = parsed["generation"]
-                    if isinstance(gen, str):
-                        text_piece = gen
-                    elif isinstance(gen, dict) and "content" in gen:
-                        text_piece = gen["content"]
-                
-                # Fallback to common text fields
-                if not text_piece:
-                    for key in ["text", "content", "body", "data"]:
-                        if key in parsed and isinstance(parsed[key], str) and parsed[key].strip():
-                            text_piece = parsed[key]
-                            break
-                
-                # If still no text, try parsing the whole event as JSON string
-                if not text_piece:
-                    try:
-                        event_str = json.dumps(parsed)
-                        text_piece = _parse_model_text(event_str)
-                    except Exception:
-                        pass
-
-                if text_piece and text_piece.strip():
-                    print(text_piece, end="", flush=True)
-                    final_text += text_piece
-                    
-            except Exception as e:
-                if DEBUG:
-                    print(f"[DEBUG] error processing stream event: {e}")
-                continue
-    except Exception as e:
-        if DEBUG:
-            print(f"[DEBUG] streaming loop terminated with error: {e}")
-
-    print()  # newline after stream
-    
-    # Final cleanup: if we collected JSON chunks, try parsing the concatenated result
-    if not final_text.strip() and json_chunks:
+    for event in response.get("body", []):
         try:
-            combined = "".join(json_chunks)
-            final_text = _parse_model_text(combined)
-        except Exception:
-            pass
-    
-    return final_text.strip() if final_text else ""
+            chunk = event.get("chunk", {})
+            raw_bytes = chunk.get("bytes")
+            if raw_bytes is None:
+                continue
+            decoded = raw_bytes.decode("utf-8") if isinstance(raw_bytes, bytes) else str(raw_bytes)
+            piece = _parse_generation(decoded)
+            if piece:
+                print(piece, end="", flush=True)
+                final_text = _append_stream_piece(final_text, piece)
+        except Exception as e:
+            if DEBUG:
+                print(f"[DEBUG] stream event error: {e}")
+    print()
+    return final_text.strip()
 
 
-# --- Prompt utilities ---
+# --- Prompts ---
 
 def make_chunk_prompt(chunk, question, idx, total):
-    prompt = (
-        "<|begin_of_text|>"
-        "<|start_header_id|>user<|end_header_id|>
-"
-        "You are an expert analyst. Answer the question using ONLY the text in this chunk.
-
-"
-        f"CHUNK {idx}/{total}:
-{chunk}
-
-"
-        "QUESTION:
-"
-        f"{question}
-
-"
-        "INSTRUCTIONS:
-"
-        "- If the chunk does not contain information that answers the question, reply exactly: NOT RELEVANT
-"
-        "- Otherwise: give a short partial answer (1-3 sentences) and one-line rationale pointing to the chunk.
-"
-        "<|eot_id|>
-"
-        "<|start_header_id|>assistant<|end_header_id|>"
+    return (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        "You are an expert analyst. Answer the question using ONLY the text in this chunk.\n\n"
+        f"CHUNK {idx}/{total}:\n{chunk}\n\nQUESTION:\n{question}\n\n"
+        "INSTRUCTIONS:\n"
+        "- If the chunk does not contain information that answers the question, reply exactly: NOT RELEVANT\n"
+        "- Otherwise: give a short partial answer (1-3 sentences) and one-line rationale.\n"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
     )
-    return prompt
 
 
 def make_synthesis_prompt(partials, question, prior_memory_text=None):
-    joined = "
-
-".join([f"PARTIAL {i+1}: {p}" for i, p in enumerate(partials)])
-    mem_section = ""
-    if prior_memory_text:
-        mem_section = f"PAST INTERACTIONS:
-{prior_memory_text}
-
-"
-    prompt = (
-        "<|begin_of_text|>"
-        "<|start_header_id|>user<|end_header_id|>
-"
-        "You are a senior researcher tasked with combining partial answers into a single clear answer.
-
-"
-        f"{mem_section}"
-        "PARTIAL ANSWERS:
-"
-        f"{joined}
-
-"
-        "INSTRUCTIONS:
-"
-        "- Merge the partials into one final answer. If the partials disagree, explain uncertainty.
-"
-        "- If none of the partials contain an answer, say 'Not found in document'.
-
-"
-        "FINAL QUESTION:
-"
-        f"{question}
-
-"
-        "FINAL ANSWER:
-"
-        "<|eot_id|>
-"
-        "<|start_header_id|>assistant<|end_header_id|>"
+    joined = "\n\n".join(f"PARTIAL {i+1}: {p}" for i, p in enumerate(partials))
+    mem = f"PAST INTERACTIONS:\n{prior_memory_text}\n\n" if prior_memory_text else ""
+    return (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        "You are a senior researcher combining partial answers into one clear answer.\n\n"
+        f"{mem}PARTIAL ANSWERS:\n{joined}\n\n"
+        "INSTRUCTIONS:\n"
+        "- Merge into one final answer. If partials disagree, explain uncertainty.\n"
+        "- If none contain an answer, say 'Not found in document'.\n"
+        "- Respect any length or format requested in the question (e.g. 'in 3 lines', 'briefly').\n\n"
+        f"FINAL QUESTION:\n{question}\n\nFINAL ANSWER:\n"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
     )
-    return prompt
 
 
-# --- Main flow ---
+# --- Main ---
 
 def main():
     if len(sys.argv) < 3:
@@ -658,79 +379,54 @@ def main():
         print("PDF file not found:", pdf_path)
         sys.exit(1)
 
-    # Load memory and check for relevant prior Q&As using semantic search
-    memory = load_memory()
-    relevant = find_relevant_memories_semantic(question, memory, top_k=MAX_MEMORY_TO_LOAD, pdf_path=pdf_path)
+    memory = load_memory_for_pdf(pdf_path)
+    if DEBUG:
+        print(f"[DEBUG] using memory file: {_pdf_memory_filename(pdf_path)}")
+    relevant = find_relevant_memories_semantic(
+        question, memory, top_k=MAX_MEMORY_TO_LOAD, pdf_path=pdf_path
+    )
     if relevant:
-        print(f"Found {len(relevant)} relevant past interaction(s). They will be included in synthesis.")
-    prior_mem_text = "\n".join([f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant]) if relevant else None
+        print(f"Found {len(relevant)} relevant past interaction(s).")
+    prior_mem_text = "\n".join(f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant) if relevant else None
 
-    print("Extracting text from PDF (first few pages)...")
+    print("Extracting text from PDF...")
     doc_text = extract_text_from_pdf(pdf_path)
-
-    if not doc_text.strip():
-        print("No text could be extracted from the PDF. Try a different file or run OCR first.")
-        sys.exit(1)
-
-    chunks = chunk_text(doc_text)
-    total = len(chunks)
-    print(f"Document split into {total} chunks (CHUNK_SIZE={CHUNK_SIZE}, OVERLAP={CHUNK_OVERLAP}).")
-
     partials = []
-    for i, chunk in enumerate(chunks, start=1):
-        print(f"Querying chunk {i}/{total}...")
-        prompt = make_chunk_prompt(chunk, question, i, total)
-        try:
-            # Use streaming where available to show progressive output for each chunk
-            resp = call_bedrock_stream(prompt)
-        except Exception as e:
-            print(f"Error calling model on chunk {i}: {e}")
-            try:
-                resp = call_bedrock(prompt)
-            except Exception as e2:
-                print(f"Fallback error on chunk {i}: {e2}")
-                continue
-
-        resp_text = resp.strip() if isinstance(resp, str) else str(resp)
-        if DEBUG:
-            print(f"[DEBUG] chunk {i} response:
-{resp_text}
-")
-
-        if resp_text.upper().strip().startswith("NOT RELEVANT"):
-            if DEBUG:
-                print(f"Chunk {i} marked not relevant.")
-            continue
-
-        partials.append(resp_text)
-
-
-    if not partials:
-        print("No relevant information found across chunks.")
+    if not doc_text.strip():
+        print("No text could be extracted from the PDF.")
         final_answer = "Not found in document"
     else:
-        print("Synthesizing final answer from partials...")
-        synth_prompt = make_synthesis_prompt(partials, question, prior_mem_text)
-        # stream the final synthesis
-        final_answer = call_bedrock_stream(synth_prompt)
-        if not final_answer or not final_answer.strip():
+        chunks = chunk_text(doc_text)
+        print(f"Document split into {len(chunks)} chunks.")
+        for i, chunk in enumerate(chunks, 1):
+            print(f"Querying chunk {i}/{len(chunks)}...")
+            try:
+                resp = call_bedrock_stream(make_chunk_prompt(chunk, question, i, len(chunks)))
+            except Exception as e:
+                print(f"Error on chunk {i}: {e}")
+                resp = call_bedrock(make_chunk_prompt(chunk, question, i, len(chunks)))
+            resp_text = (resp or "").strip()
+            if resp_text.upper().startswith("NOT RELEVANT"):
+                continue
+            partials.append(resp_text)
+
+        if not partials:
             final_answer = "Not found in document"
+        else:
+            print("Synthesizing final answer...")
+            final_answer = call_bedrock_stream(
+                make_synthesis_prompt(partials, question, prior_mem_text)
+            )
+            if not (final_answer or final_answer.strip()):
+                final_answer = "Not found in document"
 
-    print("
-=== FINAL ANSWER ===
-")
+    print("\n=== FINAL ANSWER ===\n")
     print(final_answer)
-    print("
-=== END ===
-")
+    print("\n=== END ===\n")
 
-    # Save to memory (append) - always save if SAVE_MEMORY is enabled
+    # Always save when SAVE_MEMORY=1 (never exit before this)
     if SAVE_MEMORY:
-        # Compute embedding for the final answer
         embedding = get_embedding(final_answer)
-        if embedding is None and DEBUG:
-            print("[DEBUG] failed to generate embedding for memory entry; entry will be saved without embedding")
-        
         entry = {
             "id": str(uuid.uuid4()),
             "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -739,12 +435,9 @@ def main():
             "answer": final_answer,
             "partials": partials,
             "model_id": MODEL_ID,
-            "embedding": embedding  # None if embedding generation failed
+            "embedding": embedding,
         }
-        append_memory(entry)
-        if DEBUG:
-            emb_status = f"with embedding (dim={len(embedding)})" if embedding else "without embedding"
-            print(f"[DEBUG] saved memory entry with id {entry['id']} {emb_status}")
+        append_memory_for_pdf(entry, pdf_path)
 
 
 if __name__ == "__main__":
