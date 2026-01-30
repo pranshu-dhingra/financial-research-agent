@@ -351,10 +351,16 @@ def make_chunk_prompt(chunk, question, idx, total):
     )
 
 
-def make_synthesis_prompt(partials, question, prior_memory_text=None, external_context=None):
+def make_synthesis_prompt(partials, question, prior_memory_text=None, external_context=None, external_provenance=None):
     joined = "\n\n".join(f"PARTIAL {i+1}: {p}" for i, p in enumerate(partials))
     mem = f"PAST INTERACTIONS:\n{prior_memory_text}\n\n" if prior_memory_text else ""
-    ext = f"EXTERNAL CONTEXT (live data):\n{external_context}\n\n" if external_context else ""
+    ext = ""
+    if external_context:
+        ext = f"EXTERNAL CONTEXT (live data):\n{external_context}\n\n"
+        if external_provenance:
+            urls = [p.get("url", "") for p in external_provenance if p.get("url")]
+            if urls:
+                ext += f"EXTERNAL SOURCES: {', '.join(urls)}\n\n"
     return (
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
         "You are a senior researcher combining partial answers into one clear answer.\n\n"
@@ -393,13 +399,21 @@ def main():
     prior_mem_text = "\n".join(f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant) if relevant else None
 
     external_context = None
+    external_provenance = []
     if ENABLE_TOOL_PLANNER:
         try:
             import tools
-            print("Tool planner: checking external sources...")
-            external_context = tools.run_external_search(question, call_llm_fn=call_bedrock)
-            if external_context and external_context.strip():
-                print("External context retrieved.")
+            plan = tools.tool_planner_agent(question, call_llm_fn=call_bedrock)
+            providers = plan.get("recommended_providers", [])
+            if providers:
+                print("Tool planner: checking external sources...")
+                external_context, external_provenance = tools.run_external_search(
+                    question, call_llm_fn=call_bedrock
+                )
+                if external_context and external_context.strip():
+                    print("External context retrieved.")
+            elif DEBUG:
+                print("[DEBUG] planner: answer likely internal, skipping external tools")
         except ImportError:
             pass
         except Exception as e:
@@ -433,7 +447,7 @@ def main():
                 final_answer = call_bedrock_stream(
                     make_synthesis_prompt(
                         [external_context], question, prior_mem_text,
-                        external_context=None
+                        external_context=None, external_provenance=external_provenance
                     )
                 )
                 if not (final_answer or final_answer.strip()):
@@ -443,7 +457,7 @@ def main():
         else:
             print("Synthesizing final answer...")
             final_answer = call_bedrock_stream(
-                make_synthesis_prompt(partials, question, prior_mem_text, external_context)
+                make_synthesis_prompt(partials, question, prior_mem_text, external_context, external_provenance)
             )
             if not (final_answer or final_answer.strip()):
                 final_answer = "Not found in document"

@@ -13,10 +13,22 @@ import unittest
 
 
 class TestCredentialHandshake(unittest.TestCase):
-    def test_resolve_handshake_web_search_generic_returns_ok(self):
-        """web_search_generic has no credentials required - should return ok."""
-        status = tools.resolve_credential_handshake("web_search_generic", "generic", [])
-        self.assertEqual(status, "ok")
+    def test_resolve_tool_credentials_web_search_generic_in_ready(self):
+        """web_search_generic has no credentials required - should be in ready_providers."""
+        plan = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "test"}
+        result = tools.resolve_tool_credentials(plan)
+        self.assertIn("web_search_generic", result["ready_providers"])
+
+    def test_resolve_tool_credentials_skip_fallback(self):
+        """Mock input() returning SKIP - ensure fallback to web_search_generic."""
+        plan = {"category": "macroeconomic", "recommended_providers": ["world_bank"], "reason": "test"}
+
+        def mock_input():
+            return "SKIP"
+
+        result = tools.resolve_tool_credentials(plan, input_fn=mock_input)
+        self.assertIn("web_search_generic", result["ready_providers"])
+        self.assertIn("world_bank", result["skipped"])
 
     def test_get_provider_config_missing(self):
         """Unconfigured provider returns None."""
@@ -53,6 +65,20 @@ class TestCredentialHandshake(unittest.TestCase):
         self.assertTrue(
             "not configured" in result["text"].lower() or "missing" in result["text"].lower()
         )
+
+    def test_execute_external_tools_provenance(self):
+        """execute_external_tools returns provenance-tagged snippets."""
+        snippets = tools.execute_external_tools(
+            ["web_search_generic"], "test query", "generic"
+        )
+        self.assertIsInstance(snippets, list)
+        for s in snippets:
+            self.assertEqual(s.get("type"), "external")
+            self.assertIn("tool", s)
+            self.assertIn("category", s)
+            self.assertIn("url", s)
+            self.assertIn("text", s)
+            self.assertIn("fetched_at", s)
 
 
 if __name__ == "__main__":

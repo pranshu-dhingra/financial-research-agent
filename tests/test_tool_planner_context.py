@@ -35,7 +35,7 @@ class TestToolPlannerContext(unittest.TestCase):
         self.assertIn("company_financials", tools_list)
 
     def test_planner_prompt_includes_bfsi_context(self):
-        """Ensure tool_planner_agent builds prompt with BFSI and conceptual tools."""
+        """Ensure tool_planner_agent prompt includes BFSI context and conceptual tool categories."""
         kb = tools.load_tool_knowledge_base()
         categories = {v["category"] for v in kb.values()}
         self.assertIn("generic", categories)
@@ -44,6 +44,7 @@ class TestToolPlannerContext(unittest.TestCase):
         self.assertIn("macro", categories)
         self.assertIn("credit", categories)
         self.assertIn("news", categories)
+        self.assertIn("market", categories)
 
     def test_planner_returns_valid_structure(self):
         """Ensure tool_planner_agent returns category, recommended_providers, reason."""
@@ -55,6 +56,14 @@ class TestToolPlannerContext(unittest.TestCase):
         self.assertIn("recommended_providers", result)
         self.assertIn("reason", result)
         self.assertIsInstance(result["recommended_providers"], list)
+
+    def test_planner_internal_only_returns_empty_providers(self):
+        """Planner can return recommended_providers: [] when answer likely internal."""
+        def mock_llm(prompt):
+            return '{"category": "company_financials", "recommended_providers": [], "reason": "answer likely available internally"}'
+
+        result = tools.tool_planner_agent("What does this annual report say about CET1 ratio?", call_llm_fn=mock_llm)
+        self.assertEqual(result["recommended_providers"], [])
 
 
 if __name__ == "__main__":

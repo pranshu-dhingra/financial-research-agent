@@ -18,7 +18,10 @@ Credential handshake:
 import os
 import json
 import re
+from datetime import datetime
 from pathlib import Path
+
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 # --- Conceptual tool universe (BFSI investment research) ---
 
@@ -285,13 +288,13 @@ def _web_search_duckduckgo(query: str) -> dict:
     return {"text": "External search not configured. Please add provider.", "url": ""}
 
 
-def tool_planner_agent(query: str, call_llm_fn=None):
+def tool_planner_agent(query: str, call_llm_fn=None) -> dict:
     """
-    Use LLM to decide which tool category and providers to use.
+    Tool Planner for BFSI Investment Research Agent.
     Returns dict: {category, recommended_providers: [...], reason}.
+    On parse failure: {"category":"generic","recommended_providers":["web_search_generic"],"reason":"fallback"}
     """
     kb = load_tool_knowledge_base()
-    configured = list_configured_providers()
     config = _load_tool_config()
     providers_detail = config.get("providers", {})
 
@@ -306,20 +309,28 @@ def tool_planner_agent(query: str, call_llm_fn=None):
 
     prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
 
-You are a tool planner for BFSI investment research. This project focuses on Annual Reports and Investment Research.
+You are a Tool Planner for a BFSI Investment Research Agent.
+Your job is to decide which external knowledge sources are most reliable to answer the user's question.
 
-CONCEPTUAL TOOLS (knowledge categories):
+Categories include:
+regulatory filings, company financials, macroeconomic data, market prices, credit ratings, financial news, generic web search.
+
+TOOL_KNOWLEDGE_BASE:
 {kb_desc}
 
 CONFIGURED PROVIDERS (currently available):
 {cfg_desc}
 
+If the answer is likely available internally (e.g. from the PDF/annual report), return recommended_providers: [].
+
 <|eot_id|><|start_header_id|>user<|end_header_id|>
 
-Given the user question, output a JSON object with:
-- "category": one of generic, regulatory, financials, macro, credit, news
-- "recommended_providers": list of provider names (e.g. serpapi, yahoo_finance) that would best answer this
-- "reason": brief explanation
+Given the user question, output a JSON object strictly in this format:
+{{
+  "category": "<one of the categories>",
+  "recommended_providers": ["provider1", "provider2"],
+  "reason": "why these providers are suitable"
+}}
 
 Question: {query}
 
@@ -328,39 +339,204 @@ Output only valid JSON, no other text.
 """
 
     if call_llm_fn is None:
-        # Use local_pdf_qa's call_bedrock if available
         try:
             from local_pdf_qa import call_bedrock
             call_llm_fn = call_bedrock
         except ImportError:
-            return {
-                "category": "generic",
-                "recommended_providers": ["web_search_generic"],
-                "reason": "LLM not available, defaulting to generic search",
-            }
+            out = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "fallback"}
+            if DEBUG:
+                print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']}")
+            return out
 
     raw = call_llm_fn(prompt)
     if not raw:
-        return {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "No LLM response"}
+        out = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "fallback"}
+        if DEBUG:
+            print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']}")
+        return out
 
-    # Parse JSON from response (may be wrapped in markdown)
     text = (raw or "").strip()
-    m = re.search(r"\{[^{}]*\"category\"[^{}]*\"recommended_providers\"[^{}]*\"reason\"[^{}]*\}", text, re.DOTALL)
-    if m:
-        text = m.group(0)
-    # Also try to find any {...} block
     for match in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text):
         try:
             out = json.loads(match.group(0))
             if "category" in out and "recommended_providers" in out:
                 out.setdefault("reason", "")
+                if DEBUG:
+                    print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']}")
                 return out
         except json.JSONDecodeError:
             continue
     try:
-        return json.loads(text)
+        out = json.loads(text)
+        if "category" in out and "recommended_providers" in out:
+            if DEBUG:
+                print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']}")
+            return out
     except json.JSONDecodeError:
-        return {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "Parse failed"}
+        pass
+    out = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "fallback"}
+    if DEBUG:
+        print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']} (parse failed)")
+    return out
+
+
+def prompt_for_credentials(provider_id: str, required_fields: list) -> dict | None:
+    """
+    Human-in-the-loop: prompt user for credentials, parse, store via register_credentials.
+    Returns credentials dict if successful, None otherwise.
+    """
+    if DEBUG:
+        print(f"[CREDENTIALS] requesting credentials for provider: {provider_id}")
+    print(f"Required fields: {required_fields}")
+    print("Provide as JSON e.g. {{\"api_key\": \"xxx\"}} or key=value e.g. api_key=xxx")
+    try:
+        user_input = input("> ").strip()
+    except EOFError:
+        return None
+    if user_input.upper() == "SKIP":
+        return None
+    try:
+        parsed = json.loads(user_input)
+        if isinstance(parsed, dict) and all(parsed.get(f) for f in required_fields):
+            register_credentials(provider_id, parsed)
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    creds = {}
+    for part in user_input.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            creds[k.strip()] = v.strip()
+    if all(creds.get(f) for f in required_fields):
+        register_credentials(provider_id, creds)
+        return creds
+    return None
+
+
+def resolve_tool_credentials(planner_output: dict, input_fn=None) -> dict:
+    """
+    Resolve credentials for recommended providers. Human-in-the-loop when not configured.
+    Returns: {"ready_providers": [...], "skipped": [...]}
+    """
+    providers = planner_output.get("recommended_providers", [])
+    category = planner_output.get("category", "generic")
+    ready = []
+    skipped = []
+
+    for provider in providers:
+        if provider == "web_search_generic":
+            ready.append(provider)
+            continue
+        config = get_provider_config(provider)
+        if not config:
+            print(f"External tool '{provider}' is recommended for category '{category}'.")
+            print("This tool is not configured.")
+            print("Please add it to tool_config.json or type SKIP.")
+            if input_fn:
+                user_input = input_fn()
+            else:
+                try:
+                    user_input = input("> ").strip()
+                except EOFError:
+                    user_input = "SKIP"
+            if user_input.upper() == "SKIP":
+                skipped.append(provider)
+            continue
+
+        required = config.get("required_fields", [])
+        creds = _resolve_credentials(provider, required)
+        if creds:
+            ready.append(provider)
+            continue
+
+        print(f"External tool '{provider}' is recommended for category '{category}'.")
+        print("Credentials are required for this tool.")
+        print("Please provide credentials now or type SKIP.")
+        if DEBUG:
+            print(f"[CREDENTIALS] requesting credentials for provider: {provider}")
+        creds = prompt_for_credentials(provider, required)
+        if creds:
+            ready.append(provider)
+        else:
+            skipped.append(provider)
+
+    if not ready:
+        if DEBUG:
+            print("[TOOLS] fallback to generic web search")
+        ready.append("web_search_generic")
+    return {"ready_providers": ready, "skipped": skipped}
+
+
+def call_api_tool(provider_id: str, endpoint_template: str, params: dict) -> dict:
+    """
+    Generic API call using endpoint_template. Params fill {key} placeholders.
+    Returns dict with 'text' and 'url' keys.
+    """
+    url = endpoint_template
+    for k, v in params.items():
+        url = url.replace("{" + k + "}", _url_encode(str(v)))
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return {"text": f"API request failed: {e}", "url": url}
+    return _parse_generic_search_response(raw, url)
+
+
+def execute_external_tools(ready_providers: list, query: str, category: str) -> list:
+    """
+    Execute external tools for each ready provider.
+    Returns list of provenance-tagged snippets:
+    [{"type": "external", "tool": provider, "category": category, "url": url, "text": snippet}, ...]
+    """
+    results = []
+    for provider in ready_providers:
+        if DEBUG:
+            print(f"[TOOLS] executed provider: {provider}")
+        config = get_provider_config(provider)
+        cat = category
+        if config:
+            cat = config.get("category", category)
+
+        if cat == "generic" or provider == "web_search_generic":
+            r = web_search_via_provider(query, provider)
+        else:
+            config = config or {}
+            endpoint_tpl = config.get("endpoint_template", "")
+            if endpoint_tpl:
+                creds = _resolve_credentials(provider, config.get("required_fields", [])) or {}
+                params = {"q": query, **creds}
+                r = call_api_tool(provider, endpoint_tpl, params)
+            else:
+                r = web_search_via_provider(query, provider)
+
+        text = r.get("text", "")
+        url = r.get("url", "")
+        if text and "not configured" not in text.lower() and "failed" not in text.lower():
+            results.append({
+                "type": "external",
+                "tool": provider,
+                "category": cat,
+                "url": url,
+                "text": text,
+                "fetched_at": datetime.utcnow().isoformat() + "Z",
+            })
+            break
+    if not results and "web_search_generic" not in [p for p in ready_providers]:
+        if DEBUG:
+            print("[TOOLS] fallback to generic web search")
+        r = web_search_generic(query)
+        results.append({
+            "type": "external",
+            "tool": "web_search_generic",
+            "category": "generic",
+            "url": r.get("url", ""),
+            "text": r.get("text", ""),
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+        })
+    return results
 
 
 def resolve_credential_handshake(provider_id: str, category: str, required_fields: list) -> str:
@@ -410,39 +586,24 @@ def resolve_credential_handshake(provider_id: str, category: str, required_field
     return "skip"
 
 
-def run_external_search(query: str, call_llm_fn=None) -> str:
+def run_external_search(query: str, call_llm_fn=None, input_fn=None):
     """
-    Full flow: plan -> resolve credentials -> execute search.
-    Returns combined external context text for injection into synthesis.
+    Full flow: plan -> resolve credentials -> execute tools.
+    Returns (combined_external_text, provenance_list).
+    provenance_list: [{"type":"external","tool",...}, ...]
     """
     plan = tool_planner_agent(query, call_llm_fn)
     providers = plan.get("recommended_providers", [])
     category = plan.get("category", "generic")
 
-    # Add web_search_generic as fallback
-    if "web_search_generic" not in providers:
-        providers.append("web_search_generic")
+    if not providers:
+        return "", []
 
-    results = []
-    for pid in providers:
-        if pid == "web_search_generic":
-            r = web_search_generic(query)
-            if r.get("text") and "not configured" not in r.get("text", "").lower():
-                results.append(r["text"])
-            continue
-        config = get_provider_config(pid)
-        if not config:
-            continue
-        required = config.get("required_fields", [])
-        status = resolve_credential_handshake(pid, category, required)
-        if status == "skip":
-            continue
-        if status in ("ok", "configured"):
-            r = web_search_via_provider(query, pid)
-            if r.get("text"):
-                results.append(r["text"])
-            break  # Use first successful
-    if not results:
-        r = web_search_generic(query)
-        results.append(r.get("text", ""))
-    return "\n\n".join(results) if results else ""
+    resolved = resolve_tool_credentials(plan, input_fn=input_fn)
+    ready = resolved.get("ready_providers", [])
+    if not ready:
+        return "", []
+
+    snippets = execute_external_tools(ready, query, category)
+    text_parts = [s.get("text", "") for s in snippets if s.get("text")]
+    return "\n\n".join(text_parts), snippets
