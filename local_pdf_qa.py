@@ -434,6 +434,9 @@ def main():
             print(line)
         print("\n=== CONFIDENCE ===\n")
         print(result.get("confidence", 0.0))
+        if result.get("flags"):
+            print("\n=== FLAGS ===\n")
+            print(", ".join(result["flags"]))
         print("\n=== END ===\n")
         return
 

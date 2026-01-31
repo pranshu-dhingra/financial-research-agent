@@ -13,6 +13,7 @@ from datetime import datetime
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 INTERNAL_CONF_THRESHOLD = float(os.environ.get("INTERNAL_CONF_THRESHOLD", "0.75"))
 ENABLE_TOOL_AGENT = os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1"
+ENABLE_RERANKER = os.environ.get("ENABLE_RERANKER", "0") == "1"
 
 
 def _ts():
@@ -128,6 +129,7 @@ def synthesizer_agent(
     prior_mem_text: str | None,
     question: str,
     use_streaming: bool = True,
+    variation: str | None = None,
 ) -> dict:
     """
     Merge internal partials + external evidence. Labels [INTERNAL]/[EXTERNAL].
@@ -149,8 +151,12 @@ def synthesizer_agent(
         "You are synthesizing an investment research answer.\n"
         "Label every factual sentence as [INTERNAL] or [EXTERNAL].\n"
         "Cite page numbers or URLs where applicable.\n"
-        "If evidence insufficient, say so. Do not invent facts.\n\n"
+        "If evidence insufficient, say so. Do not invent facts.\n"
     )
+    if variation:
+        prompt += f"\n{variation}\n\n"
+    else:
+        prompt += "\n\n"
     if prior_mem_text:
         prompt += f"PAST INTERACTIONS:\n{prior_mem_text}\n\n"
     if external_context:
@@ -194,34 +200,20 @@ def synthesizer_agent(
     return {"answer": answer, "provenance": provenance}
 
 
-def verifier_agent(answer: str, provenance: list) -> dict:
-    """
-    Compute confidence score from internal similarity and external corroboration.
-    Returns: {confidence, flags}
-    """
-    max_internal_sim = 0.0
-    internal_count = 0
-    external_count = 0
-    for p in provenance:
-        if p.get("type") == "internal":
-            internal_count += 1
-            sim = p.get("similarity")
-            if sim is not None:
-                max_internal_sim = max(max_internal_sim, sim)
-        elif p.get("type") == "external":
-            external_count += 1
-    external_bonus = 0.3 if external_count > 0 else 0.0
-    verifier_checks = 0.1
-    if "insufficient" in answer.lower() or "not found" in answer.lower():
-        verifier_checks = 0.0
-    confidence = 0.6 * max_internal_sim + external_bonus + verifier_checks
-    confidence = max(0.0, min(1.0, confidence))
-    flags = []
-    if internal_count == 0 and external_count == 0:
-        flags.append("no_sources")
-    if max_internal_sim < 0.5 and external_count == 0:
-        flags.append("low_internal_confidence")
-    return {"confidence": confidence, "flags": flags}
+def _verifier_agent(answer: str, provenance: list, partials: list, external_snippets: list) -> dict:
+    """Use verifier.py for BFSI-aware confidence scoring."""
+    try:
+        from verifier import verifier_agent
+        return verifier_agent(answer, provenance, partials, external_snippets)
+    except ImportError:
+        max_internal_sim = 0.0
+        internal_count = sum(1 for p in provenance if p.get("type") == "internal")
+        external_count = sum(1 for p in provenance if p.get("type") == "external")
+        for p in provenance:
+            if p.get("type") == "internal" and p.get("similarity") is not None:
+                max_internal_sim = max(max_internal_sim, p["similarity"])
+        confidence = 0.6 * max_internal_sim + (0.3 if external_count > 0 else 0) + 0.1
+        return {"confidence": min(1.0, confidence), "flags": [], "explanation": ""}
 
 
 def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
@@ -279,16 +271,51 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
     synth_input_partials = partials
     if not partials and external_provenance:
         synth_input_partials = [{"text": s.get("text", "")} for s in external_provenance]
-    synth = synthesizer_agent(
-        synth_input_partials,
-        external_provenance,
-        prior_mem_text,
-        query,
-        use_streaming=use_streaming,
-    )
-    trace.append({"agent": "synthesizer", "notes": "merged internal + external", "timestamp": _ts()})
 
-    ver = verifier_agent(synth["answer"], synth["provenance"])
+    if ENABLE_RERANKER and (synth_input_partials or external_provenance):
+        try:
+            from reranker import generate_candidate_answers, rank_candidates
+            candidates = generate_candidate_answers(
+                query, synth_input_partials, external_provenance, prior_mem_text, n=3
+            )
+            synth_temp = synthesizer_agent(
+                synth_input_partials, external_provenance, prior_mem_text, query, use_streaming=False
+            )
+            best_answer = rank_candidates(
+                query, candidates,
+                provenance=synth_temp["provenance"],
+                partials=partials,
+                external_snippets=external_provenance,
+            )
+            synth = {
+                "answer": best_answer,
+                "provenance": synthesizer_agent(
+                    synth_input_partials, external_provenance, prior_mem_text, query, use_streaming=False
+                )["provenance"],
+            }
+            trace.append({"agent": "synthesizer", "notes": "reranked from 3 candidates", "timestamp": _ts()})
+        except ImportError:
+            synth = synthesizer_agent(
+                synth_input_partials,
+                external_provenance,
+                prior_mem_text,
+                query,
+                use_streaming=use_streaming,
+            )
+            trace.append({"agent": "synthesizer", "notes": "merged internal + external", "timestamp": _ts()})
+    else:
+        synth = synthesizer_agent(
+            synth_input_partials,
+            external_provenance,
+            prior_mem_text,
+            query,
+            use_streaming=use_streaming,
+        )
+        trace.append({"agent": "synthesizer", "notes": "merged internal + external", "timestamp": _ts()})
+
+    ver = _verifier_agent(
+        synth["answer"], synth["provenance"], partials, external_provenance
+    )
     trace.append({"agent": "verifier", "confidence": ver["confidence"], "timestamp": _ts()})
 
     provenance = synth["provenance"]
@@ -301,9 +328,11 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
         p.setdefault("text", "")
         p.setdefault("similarity", None)
 
+    flags = ver.get("flags", [])
     result = {
         "answer": synth["answer"],
         "confidence": ver["confidence"],
+        "flags": flags,
         "provenance": provenance,
         "trace": trace,
     }
@@ -318,6 +347,7 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
             "question": query,
             "answer": synth["answer"],
             "confidence": ver["confidence"],
+            "flags": flags,
             "provenance": provenance,
             "embedding": emb,
             "model_id": os.environ.get("MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0"),
