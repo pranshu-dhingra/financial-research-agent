@@ -4,6 +4,9 @@
 # Uploads (user data)
 uploads/
 
+# Memory (per-PDF Q&A history)
+memories/
+
 # Python
 __pycache__/
 *.py[cod]
