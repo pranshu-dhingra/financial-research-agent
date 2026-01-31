@@ -1,2 +1,4 @@
-annoy
-numpy
+# Optional dependencies for development and testing
+# pip install -r requirements_add.txt
+
+pytest>=7.0.0
