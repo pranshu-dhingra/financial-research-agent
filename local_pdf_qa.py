@@ -20,6 +20,7 @@ Environment variables:
   CHUNK_SIZE, CHUNK_OVERLAP, MAX_PAGES, MAX_CHUNKS
   DEBUG=1, SAVE_MEMORY=1, MAX_MEMORY_TO_LOAD
   ENABLE_TOOL_PLANNER=1 - augment with BFSI external search (see tools.py)
+  USE_ORCHESTRATOR=1 - use multi-agent orchestrator (default)
 """
 
 import sys
@@ -58,6 +59,7 @@ MAX_MEMORY_TO_LOAD = int(os.environ.get("MAX_MEMORY_TO_LOAD", 5))
 
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 ENABLE_TOOL_PLANNER = os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1"
+USE_ORCHESTRATOR = os.environ.get("USE_ORCHESTRATOR", "1") == "1"
 
 MEMORY_DIR = Path("memories")
 MEMORY_DIR.mkdir(exist_ok=True)
@@ -202,6 +204,31 @@ def find_relevant_memories_semantic(question, mem_list, top_k=5, threshold=0.7, 
     if DEBUG:
         print("[DEBUG] falling back to token-overlap")
     return _find_relevant_memories_token(question, pdf_path or "", mem_list, top_k)
+
+
+def find_relevant_chunks(query: str, chunks: list, top_k: int = 10, threshold: float = 0.3):
+    """
+    Find chunks relevant to query using semantic similarity (embeddings).
+    Returns list of {chunk_text, idx, similarity}.
+    Limits embedding calls to query + min(15, len(chunks)) for efficiency.
+    """
+    if not chunks:
+        return []
+    q_vec = get_embedding(query)
+    if q_vec is None:
+        return []
+    scored = []
+    max_embed = min(len(chunks), 15)
+    for i, chunk in enumerate(chunks[:max_embed]):
+        c_vec = get_embedding(chunk[:2000])
+        if c_vec is None:
+            continue
+        cos_sim = sum(a * b for a, b in zip(q_vec, c_vec))
+        cos_sim = max(0.0, min(1.0, cos_sim))
+        if cos_sim >= threshold:
+            scored.append({"chunk_text": chunk, "idx": i, "similarity": cos_sim})
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:top_k]
 
 
 def _find_relevant_memories_token(question, pdf_path, mem_list, max_results):
@@ -387,6 +414,28 @@ def main():
     if not os.path.exists(pdf_path):
         print("PDF file not found:", pdf_path)
         sys.exit(1)
+
+    if USE_ORCHESTRATOR:
+        from orchestrator import run_workflow
+        result = run_workflow(question, pdf_path, use_streaming=True)
+        print("\n=== ANSWER ===\n")
+        print(result["answer"])
+        print("\n=== SOURCES ===\n")
+        for p in result.get("provenance", []):
+            typ = p.get("type", "internal")
+            src = p.get("source", "pdf")
+            page = p.get("page")
+            tool = p.get("tool")
+            line = f"  [{typ}] {src}"
+            if page is not None:
+                line += f" page={page}"
+            if typ == "external" and tool:
+                line += f" tool={tool}"
+            print(line)
+        print("\n=== CONFIDENCE ===\n")
+        print(result.get("confidence", 0.0))
+        print("\n=== END ===\n")
+        return
 
     memory = load_memory_for_pdf(pdf_path)
     if DEBUG:
