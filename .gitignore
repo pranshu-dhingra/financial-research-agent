@@ -1,6 +1,9 @@
 # Credentials (secrets)
 .tool_credentials.json
 
+# Uploads (user data)
+uploads/
+
 # Python
 __pycache__/
 *.py[cod]

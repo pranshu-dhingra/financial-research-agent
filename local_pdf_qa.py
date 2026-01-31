@@ -144,6 +144,21 @@ def list_all_memory_files():
     return sorted(str(p) for p in MEMORY_DIR.glob("memory_*.json"))
 
 
+def clear_memory_for_pdf(pdf_path: str):
+    """Clear memory for this PDF. Overwrites with empty list."""
+    path = _pdf_memory_filename(pdf_path)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump([], f, indent=2)
+    os.replace(tmp, path)
+
+
+def precompute_pdf_embeddings(pdf_path: str):
+    """Validate PDF and prepare for retrieval. Extracts text and chunks."""
+    doc_text = extract_text_from_pdf(pdf_path)
+    chunk_text(doc_text)
+
+
 def build_annoy_index(mem_list):
     """Build Annoy index from memories with embeddings. Returns (index, id_map) or (None, None)."""
     if not HAS_ANNOY or not mem_list:
