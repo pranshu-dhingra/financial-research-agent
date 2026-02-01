@@ -175,6 +175,73 @@ def _resolve_credentials(provider_id: str, required_fields: list):
     return creds
 
 
+def web_search_serpapi(query: str, top_k: int = 5) -> list:
+    """
+    Call SerpAPI via requests. Loads credentials from store or env.
+    Returns list of {"text": snippet, "url": link, "title": title}.
+    """
+    creds = _resolve_credentials("serpapi", ["api_key"])
+    if not creds or not creds.get("api_key"):
+        return []
+    try:
+        import requests
+        url = "https://serpapi.com/search.json"
+        params = {"engine": "google", "q": query, "api_key": creds["api_key"]}
+        resp = requests.get(url, params=params, timeout=15, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        if DEBUG:
+            print(f"[TOOLS] SerpAPI request failed: {e}")
+        return []
+    results = []
+    for r in data.get("organic_results", [])[:top_k]:
+        if isinstance(r, dict):
+            title = r.get("title", "")
+            snippet = r.get("snippet", "")
+            link = r.get("link", "")
+            if snippet or title:
+                results.append({"text": f"{title}: {snippet}".strip(": ") or snippet, "url": link, "title": title})
+    return results
+
+
+def duckduckgo_html_scrape(query: str) -> list:
+    """
+    Scrape DuckDuckGo HTML results using requests + BeautifulSoup.
+    Returns list of {"text": snippet, "url": link, "title": title}.
+    """
+    try:
+        import requests
+        from bs4 import BeautifulSoup
+        import urllib.parse
+        base = "https://html.duckduckgo.com/html/"
+        data = {"q": query}
+        resp = requests.post(base, data=data, timeout=10, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+        for item in soup.select(".result")[:5]:
+            title_el = item.select_one(".result__title a") or item.select_one(".result__title")
+            snippet_el = item.select_one(".result__snippet")
+            link_el = item.select_one(".result__title a") or item.select_one("a.result__a")
+            title = title_el.get_text(strip=True) if title_el else ""
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            link = ""
+            if link_el and hasattr(link_el, "get"):
+                link = link_el.get("href", "") or ""
+            if link and link.startswith("//"):
+                link = "https:" + link
+            if not link:
+                link = f"https://duckduckgo.com/?q={urllib.parse.quote(query)}"
+            if snippet or title:
+                results.append({"text": f"{title}: {snippet}".strip(": ") or snippet or title, "url": link, "title": title})
+        return results
+    except Exception as e:
+        if DEBUG:
+            print(f"[TOOLS] DuckDuckGo scrape failed: {e}")
+        return []
+
+
 def web_search_via_provider(query: str, provider_id: str, **extra_creds):
     """
     Execute web search via a configured provider.
@@ -186,6 +253,22 @@ def web_search_via_provider(query: str, provider_id: str, **extra_creds):
 
     if provider_id == "web_search_generic":
         return web_search_generic(query)
+
+    if provider_id == "serpapi":
+        creds = _resolve_credentials(provider_id, ["api_key"]) or {}
+        creds.update(extra_creds)
+        if not creds.get("api_key"):
+            return {"text": "Missing credentials for serpapi: ['api_key']", "url": ""}
+        if DEBUG:
+            print("[TOOLS] Using external provider: serpapi")
+        snippets = web_search_serpapi(query, top_k=5)
+        if DEBUG:
+            print(f"[TOOLS] Retrieved {len(snippets)} external snippets")
+        if not snippets:
+            return duckduckgo_html_scrape_fallback(query)
+        text = "\n".join(s.get("text", "") for s in snippets)
+        url = snippets[0].get("url", "https://serpapi.com") if snippets else ""
+        return {"text": text[:4000], "url": url}
 
     required = config.get("required_fields", [])
     endpoint_tpl = config.get("endpoint_template", "")
@@ -217,6 +300,16 @@ def web_search_via_provider(query: str, provider_id: str, **extra_creds):
         return _parse_serpapi_response(raw, url)
     # Generic: try to extract snippets from JSON if possible
     return _parse_generic_search_response(raw, url)
+
+
+def duckduckgo_html_scrape_fallback(query: str) -> dict:
+    """Fallback: DuckDuckGo scrape when SerpAPI fails or returns empty."""
+    snippets = duckduckgo_html_scrape(query)
+    if not snippets:
+        return {"text": "External search not configured. Please add provider.", "url": ""}
+    text = "\n".join(s.get("text", "") for s in snippets)
+    url = snippets[0].get("url", f"https://duckduckgo.com/?q={_url_encode(query)}") if snippets else ""
+    return {"text": text[:4000], "url": url}
 
 
 def _url_encode(s: str) -> str:
@@ -263,29 +356,9 @@ def _parse_generic_search_response(raw: str, url: str) -> dict:
 def web_search_generic(query: str) -> dict:
     """
     Default generic web search - no credentials required.
-    Uses DuckDuckGo HTML scraping if possible, else returns stub.
+    Uses DuckDuckGo HTML scraping (BeautifulSoup) if possible, else returns stub.
     """
-    try:
-        return _web_search_duckduckgo(query)
-    except Exception:
-        return {"text": "External search not configured. Please add provider.", "url": ""}
-
-
-def _web_search_duckduckgo(query: str) -> dict:
-    """DuckDuckGo HTML scrape (no API key)."""
-    import urllib.parse
-    import urllib.request
-    base = "https://html.duckduckgo.com/html/"
-    data = urllib.parse.urlencode({"q": query}).encode()
-    req = urllib.request.Request(base, data=data, headers={"User-Agent": "BFSI-PDF-QA/1.0"}, method="POST")
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        html = resp.read().decode("utf-8", errors="replace")
-    # Simple extraction of result snippets
-    snippets = re.findall(r'class="result__snippet"[^>]*>([^<]+)', html)
-    if snippets:
-        text = "\n".join(s[:200] for s in snippets[:5])
-        return {"text": text[:4000], "url": f"https://duckduckgo.com/?q={urllib.parse.quote(query)}"}
-    return {"text": "External search not configured. Please add provider.", "url": ""}
+    return duckduckgo_html_scrape_fallback(query)
 
 
 def tool_planner_agent(query: str, call_llm_fn=None) -> dict:
@@ -350,7 +423,7 @@ Output only valid JSON, no other text.
 
     raw = call_llm_fn(prompt)
     if not raw:
-        out = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "fallback"}
+        out = {"category": "generic", "recommended_providers": ["serpapi"] if get_provider_config("serpapi") else ["web_search_generic"], "reason": "fallback"}
         if DEBUG:
             print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']}")
         return out
@@ -374,7 +447,11 @@ Output only valid JSON, no other text.
             return out
     except json.JSONDecodeError:
         pass
-    out = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "fallback"}
+    # Fallback: recommend serpapi if configured, else web_search_generic
+    if get_provider_config("serpapi"):
+        out = {"category": "generic", "recommended_providers": ["serpapi"], "reason": "fallback (parse failed)"}
+    else:
+        out = {"category": "generic", "recommended_providers": ["web_search_generic"], "reason": "fallback"}
     if DEBUG:
         print(f"[PLANNER] category={out['category']} providers={out['recommended_providers']} (parse failed)")
     return out
@@ -449,9 +526,12 @@ def resolve_tool_credentials(planner_output: dict, input_fn=None) -> dict:
             ready.append(provider)
             continue
 
-        print(f"External tool '{provider}' is recommended for category '{category}'.")
-        print("Credentials are required for this tool.")
-        print("Please provide credentials now or type SKIP.")
+        if provider == "serpapi":
+            print("External web search requires SerpAPI key. Enter now or SKIP.")
+        else:
+            print(f"External tool '{provider}' is recommended for category '{category}'.")
+            print("Credentials are required for this tool.")
+            print("Please provide credentials now or type SKIP.")
         if DEBUG:
             print(f"[CREDENTIALS] requesting credentials for provider: {provider}")
         creds = prompt_for_credentials(provider, required)
@@ -524,6 +604,8 @@ def execute_external_tools(ready_providers: list, query: str, category: str) -> 
                 "fetched_at": datetime.utcnow().isoformat() + "Z",
             })
             break
+    if results and DEBUG:
+        print(f"[TOOLS] Retrieved {len(results)} external snippets")
     if not results and "web_search_generic" not in [p for p in ready_providers]:
         if DEBUG:
             print("[TOOLS] fallback to generic web search")

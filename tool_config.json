@@ -2,7 +2,7 @@
   "providers": {
     "serpapi": {
       "category": "generic",
-      "endpoint_template": "https://api.serpapi.com/search?q={q}&api_key={api_key}",
+      "endpoint_template": "https://serpapi.com/search.json?engine=google&q={q}&api_key={api_key}",
       "required_fields": ["api_key"]
     },
     "web_search_generic": {
