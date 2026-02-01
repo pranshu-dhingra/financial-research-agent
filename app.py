@@ -92,16 +92,31 @@ def main():
     if ask_clicked and question and selected and selected != "(No PDFs available)":
         pdf_path = selected
         if live_mode:
-            with st.spinner("Running orchestrator..."):
-                try:
-                    from orchestrator import run_workflow
-                    result = run_workflow(question, pdf_path, use_streaming=False)
-                except Exception as e:
-                    st.error(f"Error: {e}")
-                    result = None
+            placeholder = st.empty()
+            logbox = st.empty()
+            answer_text = ""
+            result = None
+            try:
+                from orchestrator import run_workflow_stream
+                for event in run_workflow_stream(question, pdf_path, max_chunks=5, timeout_sec=20):
+                    if event.get("type") == "log":
+                        logbox.markdown("**" + event.get("message", "") + "**")
+                    elif event.get("type") == "token":
+                        answer_text += event.get("text", "")
+                        placeholder.markdown(answer_text or "_Thinking..._")
+                    elif event.get("type") == "final":
+                        result = event
+                        break
+                    elif event.get("type") == "error":
+                        st.error(event.get("message", "Unknown error"))
+                        break
+            except Exception as e:
+                st.error(f"Error: {e}")
             if result:
+                logbox.empty()
+                placeholder.empty()
                 st.subheader("Answer")
-                st.write(result["answer"])
+                st.write(result.get("answer", ""))
                 st.subheader("Sources")
                 prov = result.get("provenance", [])
                 if prov:
@@ -126,10 +141,7 @@ def main():
                     label = "Low"
                 st.write(f"{conf:.2f} ({label})")
                 if result.get("flags"):
-                    st.caption(f"Flags: {', '.join(result['flags'])}")
-                if DEBUG and result.get("trace"):
-                    with st.expander("Debug: Orchestrator Trace"):
-                        st.json(result["trace"])
+                    st.caption(f"Flags: {', '.join(result.get('flags', []))}")
         else:
             memory = load_memory_for_pdf(pdf_path)
             if not memory:

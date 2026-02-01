@@ -379,6 +379,39 @@ def call_bedrock_stream(prompt, model_id=MODEL_ID, region=REGION):
     return final_text.strip()
 
 
+def call_bedrock_stream_gen(prompt, model_id=MODEL_ID, region=REGION):
+    """
+    Generator: yields token pieces from Bedrock streaming.
+    Does not print to stdout (for Streamlit/UI consumption).
+    Yields: str (each token piece)
+    """
+    client = boto3.client("bedrock-runtime", region_name=region)
+    if not hasattr(client, "invoke_model_with_response_stream"):
+        full = call_bedrock(prompt, model_id=model_id, region=region)
+        if full:
+            yield full
+        return
+    response = client.invoke_model_with_response_stream(
+        modelId=model_id,
+        contentType="application/json",
+        accept="application/json",
+        body=json.dumps(_prepare_request(prompt)),
+    )
+    for event in response.get("body", []):
+        try:
+            chunk = event.get("chunk", {})
+            raw_bytes = chunk.get("bytes")
+            if raw_bytes is None:
+                continue
+            decoded = raw_bytes.decode("utf-8") if isinstance(raw_bytes, bytes) else str(raw_bytes)
+            piece = _parse_generation(decoded)
+            if piece:
+                yield piece
+        except Exception as e:
+            if DEBUG:
+                print(f"[DEBUG] stream event error: {e}")
+
+
 # --- Prompts ---
 
 def make_chunk_prompt(chunk, question, idx, total):

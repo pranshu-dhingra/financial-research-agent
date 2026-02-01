@@ -8,12 +8,18 @@ Epistemic contract: Query Classification, Source Attribution, Confidence Scoring
 
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
 
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 INTERNAL_CONF_THRESHOLD = float(os.environ.get("INTERNAL_CONF_THRESHOLD", "0.75"))
 ENABLE_TOOL_AGENT = os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1"
 ENABLE_RERANKER = os.environ.get("ENABLE_RERANKER", "0") == "1"
+
+# Streaming defaults
+DEFAULT_MAX_CHUNKS = 5
+DEFAULT_TOOL_TIMEOUT = 10
+DEFAULT_TOTAL_TIMEOUT = 20
 
 
 def _ts():
@@ -200,6 +206,56 @@ def synthesizer_agent(
     return {"answer": answer, "provenance": provenance}
 
 
+def synthesizer_agent_stream(
+    partials: list,
+    external_snippets: list,
+    prior_mem_text: str | None,
+    question: str,
+    variation: str | None = None,
+):
+    """
+    Generator: yields {"type":"token","text":piece} for each token from synthesis.
+    Does not return; caller accumulates text and builds provenance from partials/external_snippets.
+    """
+    from local_pdf_qa import call_bedrock_stream_gen, call_bedrock
+
+    if not partials and not external_snippets:
+        yield {"type": "token", "text": "Insufficient evidence. No relevant internal or external sources found."}
+        return
+    partial_texts = [p.get("text", p) if isinstance(p, dict) else str(p) for p in partials]
+    if not partial_texts and external_snippets:
+        partial_texts = [s.get("text", "") for s in external_snippets if s.get("text")]
+    external_context = "\n\n".join(s.get("text", "") for s in external_snippets if s.get("text"))
+    prompt = (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        "You are synthesizing an investment research answer.\n"
+        "Label every factual sentence as [INTERNAL] or [EXTERNAL].\n"
+        "Cite page numbers or URLs where applicable.\n"
+        "If evidence insufficient, say so. Do not invent facts.\n"
+    )
+    if variation:
+        prompt += f"\n{variation}\n\n"
+    else:
+        prompt += "\n\n"
+    if prior_mem_text:
+        prompt += f"PAST INTERACTIONS:\n{prior_mem_text}\n\n"
+    if external_context:
+        prompt += f"EXTERNAL CONTEXT:\n{external_context}\n\n"
+    prompt += "PARTIAL ANSWERS:\n"
+    for i, p in enumerate(partial_texts, 1):
+        prompt += f"\nPARTIAL {i}: {p}"
+    prompt += f"\n\nFINAL QUESTION:\n{question}\n\nFINAL ANSWER:\n"
+    prompt += "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+    try:
+        for piece in call_bedrock_stream_gen(prompt):
+            if piece:
+                yield {"type": "token", "text": piece}
+    except Exception:
+        fallback = call_bedrock(prompt)
+        if fallback:
+            yield {"type": "token", "text": fallback}
+
+
 def _verifier_agent(answer: str, provenance: list, partials: list, external_snippets: list) -> dict:
     """Use verifier.py for BFSI-aware confidence scoring."""
     try:
@@ -355,3 +411,190 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
         append_memory_for_pdf(entry, pdf_path)
 
     return result
+
+
+def _run_with_timeout(fn, timeout_sec, *args, **kwargs):
+    """Run fn in thread with timeout. Returns result or raises FuturesTimeoutError."""
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        future = ex.submit(fn, *args, **kwargs)
+        return future.result(timeout=timeout_sec)
+
+
+def run_workflow_stream(
+    query: str,
+    pdf_path: str,
+    max_chunks: int = DEFAULT_MAX_CHUNKS,
+    timeout_sec: int = DEFAULT_TOTAL_TIMEOUT,
+):
+    """
+    Generator: yields structured events for Streamlit-compatible streaming.
+    Events: {"type":"log","message":"..."} | {"type":"token","text":"..."} | {"type":"final",...} | {"type":"error","message":"..."}
+    """
+    tool_timeout = min(DEFAULT_TOOL_TIMEOUT, timeout_sec - 5)
+    step_timeout = max(2, (timeout_sec - tool_timeout) // 5)
+
+    try:
+        yield {"type": "log", "message": "Classifying query..."}
+        try:
+            cls = _run_with_timeout(classifier_agent, step_timeout, query, pdf_path)
+        except FuturesTimeoutError:
+            yield {"type": "error", "message": "System timed out (classifier)"}
+            return
+
+        yield {"type": "log", "message": "Retrieving internal chunks..."}
+        try:
+            partials = _run_with_timeout(
+                retriever_agent, step_timeout, query, pdf_path,
+                **{"use_streaming": False}
+            )
+            partials = partials[:max_chunks] if partials else []
+        except FuturesTimeoutError:
+            yield {"type": "error", "message": "System timed out (retriever)"}
+            return
+
+        external_text = ""
+        external_provenance = []
+        if ENABLE_TOOL_AGENT and cls.get("external_needed", True):
+            yield {"type": "log", "message": "Calling external tools..."}
+            try:
+                import tools
+                tool_plan = _run_with_timeout(
+                    lambda: tools.tool_planner_agent(query, call_llm_fn=_call_llm()[0]),
+                    step_timeout
+                )
+                providers = tool_plan.get("recommended_providers", [])
+                if providers:
+                    resolved = tools.resolve_tool_credentials(tool_plan, input_fn=lambda: "SKIP")
+                    ready = resolved.get("ready_providers", [])
+                    if ready:
+                        external_text, external_provenance = _run_with_timeout(
+                            tool_agent, tool_timeout, query
+                        )
+            except FuturesTimeoutError:
+                pass
+            except Exception:
+                pass
+
+        from local_pdf_qa import load_memory_for_pdf, find_relevant_memories_semantic
+        memory = load_memory_for_pdf(pdf_path)
+        relevant_mem = find_relevant_memories_semantic(query, memory, top_k=5, pdf_path=pdf_path)
+        prior_mem_text = None
+        if relevant_mem:
+            prior_mem_text = "\n".join(
+                f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant_mem
+            )
+
+        synth_input_partials = partials
+        if not partials and external_provenance:
+            synth_input_partials = [{"text": s.get("text", "")} for s in external_provenance]
+
+        if ENABLE_RERANKER and (synth_input_partials or external_provenance):
+            yield {"type": "log", "message": "Synthesizing answer (reranking)..."}
+            try:
+                from reranker import generate_candidate_answers, rank_candidates
+                synth_temp = synthesizer_agent(
+                    synth_input_partials, external_provenance, prior_mem_text, query, use_streaming=False
+                )
+                candidates = generate_candidate_answers(
+                    query, synth_input_partials, external_provenance, prior_mem_text, n=3
+                )
+                best_answer = rank_candidates(
+                    query, candidates,
+                    provenance=synth_temp["provenance"],
+                    partials=partials,
+                    external_snippets=external_provenance,
+                )
+                synth = {"answer": best_answer, "provenance": synth_temp["provenance"]}
+            except ImportError:
+                answer_acc = ""
+                yield {"type": "log", "message": "Synthesizing answer..."}
+                for ev in synthesizer_agent_stream(
+                    synth_input_partials, external_provenance, prior_mem_text, query
+                ):
+                    if ev.get("type") == "token":
+                        answer_acc += ev.get("text", "")
+                        yield ev
+                    else:
+                        yield ev
+                provenance = []
+                for p in partials:
+                    if isinstance(p, dict):
+                        provenance.append({
+                            "type": "internal", "source": "pdf", "page": p.get("page"),
+                            "tool": None, "category": None, "text": p.get("text", "")[:500],
+                            "similarity": p.get("similarity"),
+                        })
+                for s in external_provenance:
+                    provenance.append({
+                        "type": "external", "source": s.get("url", ""), "page": None,
+                        "tool": s.get("tool"), "category": s.get("category"),
+                        "text": s.get("text", "")[:500], "similarity": None,
+                    })
+                synth = {"answer": answer_acc.strip() or "Insufficient evidence.", "provenance": provenance}
+        else:
+            answer_acc = ""
+            yield {"type": "log", "message": "Synthesizing answer..."}
+            for ev in synthesizer_agent_stream(
+                synth_input_partials, external_provenance, prior_mem_text, query
+            ):
+                if ev.get("type") == "token":
+                    answer_acc += ev.get("text", "")
+                    yield ev
+                else:
+                    yield ev
+            provenance = []
+            for p in partials:
+                if isinstance(p, dict):
+                    provenance.append({
+                        "type": "internal", "source": "pdf", "page": p.get("page"),
+                        "tool": None, "category": None, "text": p.get("text", "")[:500],
+                        "similarity": p.get("similarity"),
+                    })
+            for s in external_provenance:
+                provenance.append({
+                    "type": "external", "source": s.get("url", ""), "page": None,
+                    "tool": s.get("tool"), "category": s.get("category"),
+                    "text": s.get("text", "")[:500], "similarity": None,
+                })
+            for p in provenance:
+                p.setdefault("type", "internal")
+                p.setdefault("source", "pdf")
+                p.setdefault("page", None)
+                p.setdefault("tool", None)
+                p.setdefault("category", None)
+                p.setdefault("text", "")
+                p.setdefault("similarity", None)
+            synth = {"answer": answer_acc.strip() or "Insufficient evidence.", "provenance": provenance}
+
+        yield {"type": "log", "message": "Verifying answer..."}
+        ver = _verifier_agent(
+            synth["answer"], synth["provenance"], partials, external_provenance
+        )
+
+        yield {"type": "log", "message": "Saving to memory..."}
+        if os.environ.get("SAVE_MEMORY", "1") != "0":
+            from local_pdf_qa import get_embedding, append_memory_for_pdf
+            emb = get_embedding(synth["answer"])
+            entry = {
+                "id": str(uuid.uuid4()),
+                "timestamp": _ts(),
+                "pdf_path": os.path.abspath(pdf_path),
+                "question": query,
+                "answer": synth["answer"],
+                "confidence": ver["confidence"],
+                "flags": ver.get("flags", []),
+                "provenance": synth["provenance"],
+                "embedding": emb,
+                "model_id": os.environ.get("MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0"),
+            }
+            append_memory_for_pdf(entry, pdf_path)
+
+        yield {
+            "type": "final",
+            "answer": synth["answer"],
+            "confidence": ver["confidence"],
+            "provenance": synth["provenance"],
+            "flags": ver.get("flags", []),
+        }
+    except Exception as e:
+        yield {"type": "error", "message": "Agent failed. Try reducing query complexity."}
