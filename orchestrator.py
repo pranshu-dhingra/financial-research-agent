@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from datetime import datetime
 
 DEBUG = os.environ.get("DEBUG", "0") == "1"
-INTERNAL_CONF_THRESHOLD = float(os.environ.get("INTERNAL_CONF_THRESHOLD", "0.75"))
+INTERNAL_CONF_THRESHOLD = float(os.environ.get("INTERNAL_CONF_THRESHOLD", "0.70"))
 ENABLE_TOOL_AGENT = os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1"
 ENABLE_RERANKER = os.environ.get("ENABLE_RERANKER", "0") == "1"
 
@@ -34,28 +34,44 @@ def _call_llm():
 
 def classifier_agent(query: str, pdf_path: str) -> dict:
     """
-    Decide if internal knowledge sufficient or external needed.
+    Fast local classifier. No LLM or embedding API calls.
+    Uses token-overlap similarity only.
     Returns: {internal_sufficient, external_needed, reason}
     """
-    from local_pdf_qa import extract_text_from_pdf, chunk_text, find_relevant_chunks
+    from local_pdf_qa import extract_text_from_pdf, chunk_text, find_relevant_chunks_token
 
     doc_text = extract_text_from_pdf(pdf_path)
     chunks = chunk_text(doc_text)
     if not chunks:
+        if DEBUG:
+            print("[CLASSIFIER] No chunks → external required")
         return {
             "internal_sufficient": False,
             "external_needed": True,
             "reason": "No chunks extracted from PDF",
         }
-    relevant = find_relevant_chunks(query, chunks, top_k=5, threshold=0.3)
-    max_sim = max((r["similarity"] for r in relevant), default=0.0)
+    results = find_relevant_chunks_token(query, chunks, top_k=3)
+    if not results:
+        if DEBUG:
+            print("[CLASSIFIER] max_similarity=0.00 → external required")
+        return {
+            "internal_sufficient": False,
+            "external_needed": True,
+            "reason": "No relevant internal chunks",
+        }
+    max_sim = max(r["similarity"] for r in results)
     internal_sufficient = max_sim >= INTERNAL_CONF_THRESHOLD
     external_needed = not internal_sufficient
-    reason = f"max_similarity={max_sim:.2f} vs threshold={INTERNAL_CONF_THRESHOLD}"
+    if internal_sufficient:
+        if DEBUG:
+            print(f"[CLASSIFIER] max_similarity={max_sim:.2f} → internal sufficient")
+    else:
+        if DEBUG:
+            print(f"[CLASSIFIER] max_similarity={max_sim:.2f} → external required")
     return {
         "internal_sufficient": internal_sufficient,
         "external_needed": external_needed,
-        "reason": reason,
+        "reason": f"max_similarity={max_sim:.2f} vs threshold={INTERNAL_CONF_THRESHOLD}",
     }
 
 
@@ -450,11 +466,7 @@ def run_workflow_stream(
         t0 = time.time()
         yield {"type": "log", "message": "Classifying query..."}
         t_classifier = time.time()
-        try:
-            cls = _run_with_timeout(classifier_agent, step_timeout, query, pdf_path)
-        except FuturesTimeoutError:
-            yield {"type": "error", "message": "System timed out (classifier)"}
-            return
+        cls = classifier_agent(query, pdf_path)
         _trace("classifier", t_classifier)
 
         yield {"type": "log", "message": "Retrieving internal chunks..."}

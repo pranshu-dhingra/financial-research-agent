@@ -29,7 +29,7 @@ from unittest.mock import patch
 from orchestrator import classifier_agent
 with patch('local_pdf_qa.extract_text_from_pdf', return_value='sample'):
     with patch('local_pdf_qa.chunk_text', return_value=['chunk1']):
-        with patch('local_pdf_qa.find_relevant_chunks', return_value=[
+        with patch('local_pdf_qa.find_relevant_chunks_token', return_value=[
             {'chunk_text': 'c', 'idx': 0, 'similarity': 0.9}
         ]):
             r = classifier_agent('test query', 'dummy.pdf')

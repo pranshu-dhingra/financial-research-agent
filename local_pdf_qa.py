@@ -246,6 +246,29 @@ def find_relevant_chunks(query: str, chunks: list, top_k: int = 10, threshold: f
     return scored[:top_k]
 
 
+def find_relevant_chunks_token(query: str, chunks: list, top_k: int = 3, threshold: float = 0.0):
+    """
+    Fast local token-overlap relevance. No API calls.
+    Returns list of {chunk_text, idx, similarity} sorted by similarity.
+    Similarity = |query_tokens ∩ chunk_tokens| / max(1, |query_tokens|), range 0-1.
+    """
+    if not chunks:
+        return []
+    q_tokens = set(w.lower() for w in query.split() if len(w) > 2)
+    if not q_tokens:
+        return []
+    scored = []
+    for i, chunk in enumerate(chunks):
+        c_tokens = set(w.lower() for w in chunk.split() if len(w) > 2)
+        overlap = len(q_tokens & c_tokens)
+        sim = overlap / max(1, len(q_tokens))
+        sim = max(0.0, min(1.0, sim))
+        if sim >= threshold:
+            scored.append({"chunk_text": chunk, "idx": i, "similarity": sim})
+    scored.sort(key=lambda x: x["similarity"], reverse=True)
+    return scored[:top_k]
+
+
 def _find_relevant_memories_token(question, pdf_path, mem_list, max_results):
     """Token-overlap relevance. Used only when semantic search fails."""
     if not mem_list:

@@ -16,7 +16,7 @@ class TestOrchestratorFlow(unittest.TestCase):
 
         with patch("local_pdf_qa.extract_text_from_pdf", return_value="sample text"):
             with patch("local_pdf_qa.chunk_text", return_value=["chunk1", "chunk2"]):
-                with patch("local_pdf_qa.find_relevant_chunks", return_value=[
+                with patch("local_pdf_qa.find_relevant_chunks_token", return_value=[
                     {"chunk_text": "c1", "idx": 0, "similarity": 0.85},
                 ]):
                     result = classifier_agent("test", "dummy.pdf")
@@ -30,7 +30,7 @@ class TestOrchestratorFlow(unittest.TestCase):
 
         with patch("local_pdf_qa.extract_text_from_pdf", return_value="sample text"):
             with patch("local_pdf_qa.chunk_text", return_value=["chunk1", "chunk2"]):
-                with patch("local_pdf_qa.find_relevant_chunks", return_value=[]):
+                with patch("local_pdf_qa.find_relevant_chunks_token", return_value=[]):
                     result = classifier_agent("test", "dummy.pdf")
                     self.assertIn("internal_sufficient", result)
                     self.assertIn("external_needed", result)
