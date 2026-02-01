@@ -7,6 +7,10 @@ uploads/
 # Memory (per-PDF Q&A history)
 memories/
 
+# Evaluation artifacts (generated)
+evaluation_results.json
+evaluation_results.md
+
 # Python
 __pycache__/
 *.py[cod]

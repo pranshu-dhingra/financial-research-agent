@@ -7,6 +7,7 @@ Epistemic contract: Query Classification, Source Attribution, Confidence Scoring
 """
 
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime
@@ -429,19 +430,35 @@ def run_workflow_stream(
     """
     Generator: yields structured events for Streamlit-compatible streaming.
     Events: {"type":"log","message":"..."} | {"type":"token","text":"..."} | {"type":"final",...} | {"type":"error","message":"..."}
+    Final event includes: answer, confidence, provenance, flags, trace, tool_calls
     """
     tool_timeout = min(DEFAULT_TOOL_TIMEOUT, timeout_sec - 5)
     step_timeout = max(2, (timeout_sec - tool_timeout) // 5)
+    trace = []
+    tool_calls = []
+
+    def _trace(stage: str, start_ts: float):
+        end_ts = time.time()
+        trace.append({
+            "stage": stage,
+            "start": start_ts,
+            "end": end_ts,
+            "latency_seconds": round(end_ts - start_ts, 3),
+        })
 
     try:
+        t0 = time.time()
         yield {"type": "log", "message": "Classifying query..."}
+        t_classifier = time.time()
         try:
             cls = _run_with_timeout(classifier_agent, step_timeout, query, pdf_path)
         except FuturesTimeoutError:
             yield {"type": "error", "message": "System timed out (classifier)"}
             return
+        _trace("classifier", t_classifier)
 
         yield {"type": "log", "message": "Retrieving internal chunks..."}
+        t_retriever = time.time()
         try:
             partials = _run_with_timeout(
                 retriever_agent, step_timeout, query, pdf_path,
@@ -451,28 +468,36 @@ def run_workflow_stream(
         except FuturesTimeoutError:
             yield {"type": "error", "message": "System timed out (retriever)"}
             return
+        _trace("retriever", t_retriever)
 
         external_text = ""
         external_provenance = []
         if ENABLE_TOOL_AGENT and cls.get("external_needed", True):
             yield {"type": "log", "message": "Calling external tools..."}
+            t_tool_planner = time.time()
             try:
                 import tools
                 tool_plan = _run_with_timeout(
                     lambda: tools.tool_planner_agent(query, call_llm_fn=_call_llm()[0]),
                     step_timeout
                 )
+                _trace("tool_planner", t_tool_planner)
                 providers = tool_plan.get("recommended_providers", [])
                 if providers:
                     resolved = tools.resolve_tool_credentials(tool_plan, input_fn=lambda: "SKIP")
                     ready = resolved.get("ready_providers", [])
+                    tool_calls.extend(ready)
                     if ready:
+                        t_tool_exec = time.time()
                         external_text, external_provenance = _run_with_timeout(
                             tool_agent, tool_timeout, query
                         )
+                        _trace("tool_execution", t_tool_exec)
             except FuturesTimeoutError:
+                _trace("tool_planner", t_tool_planner)
                 pass
             except Exception:
+                _trace("tool_planner", t_tool_planner)
                 pass
 
         from local_pdf_qa import load_memory_for_pdf, find_relevant_memories_semantic
@@ -490,6 +515,7 @@ def run_workflow_stream(
 
         if ENABLE_RERANKER and (synth_input_partials or external_provenance):
             yield {"type": "log", "message": "Synthesizing answer (reranking)..."}
+            t_synth = time.time()
             try:
                 from reranker import generate_candidate_answers, rank_candidates
                 synth_temp = synthesizer_agent(
@@ -505,6 +531,7 @@ def run_workflow_stream(
                     external_snippets=external_provenance,
                 )
                 synth = {"answer": best_answer, "provenance": synth_temp["provenance"]}
+                _trace("synthesizer", t_synth)
             except ImportError:
                 answer_acc = ""
                 yield {"type": "log", "message": "Synthesizing answer..."}
@@ -531,9 +558,11 @@ def run_workflow_stream(
                         "text": s.get("text", "")[:500], "similarity": None,
                     })
                 synth = {"answer": answer_acc.strip() or "Insufficient evidence.", "provenance": provenance}
+                _trace("synthesizer", t_synth)
         else:
             answer_acc = ""
             yield {"type": "log", "message": "Synthesizing answer..."}
+            t_synth = time.time()
             for ev in synthesizer_agent_stream(
                 synth_input_partials, external_provenance, prior_mem_text, query
             ):
@@ -565,13 +594,17 @@ def run_workflow_stream(
                 p.setdefault("text", "")
                 p.setdefault("similarity", None)
             synth = {"answer": answer_acc.strip() or "Insufficient evidence.", "provenance": provenance}
+            _trace("synthesizer", t_synth)
 
         yield {"type": "log", "message": "Verifying answer..."}
+        t_verifier = time.time()
         ver = _verifier_agent(
             synth["answer"], synth["provenance"], partials, external_provenance
         )
+        _trace("verifier", t_verifier)
 
         yield {"type": "log", "message": "Saving to memory..."}
+        t_memory = time.time()
         if os.environ.get("SAVE_MEMORY", "1") != "0":
             from local_pdf_qa import get_embedding, append_memory_for_pdf
             emb = get_embedding(synth["answer"])
@@ -588,6 +621,10 @@ def run_workflow_stream(
                 "model_id": os.environ.get("MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0"),
             }
             append_memory_for_pdf(entry, pdf_path)
+        _trace("memory_write", t_memory)
+
+        total_latency = round(time.time() - t0, 3)
+        trace.append({"stage": "total", "start": t0, "end": time.time(), "latency_seconds": total_latency})
 
         yield {
             "type": "final",
@@ -595,6 +632,8 @@ def run_workflow_stream(
             "confidence": ver["confidence"],
             "provenance": synth["provenance"],
             "flags": ver.get("flags", []),
+            "trace": trace,
+            "tool_calls": tool_calls,
         }
     except Exception as e:
         yield {"type": "error", "message": "Agent failed. Try reducing query complexity."}
