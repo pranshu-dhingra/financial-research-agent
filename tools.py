@@ -187,13 +187,13 @@ def web_search_serpapi(query: str, top_k: int = 5) -> list:
         import requests
         url = "https://serpapi.com/search.json"
         params = {"engine": "google", "q": query, "api_key": creds["api_key"]}
-        resp = requests.get(url, params=params, timeout=15, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
+        resp = requests.get(url, params=params, timeout=10, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
         resp.raise_for_status()
         data = resp.json()
     except Exception as e:
         if DEBUG:
             print(f"[TOOLS] SerpAPI request failed: {e}")
-        return []
+        return []  # Caller handles empty; execute_external_tools returns structured error
     results = []
     for r in data.get("organic_results", [])[:top_k]:
         if isinstance(r, dict):
@@ -290,7 +290,7 @@ def web_search_via_provider(query: str, provider_id: str, **extra_creds):
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         return {"text": f"Search request failed: {e}", "url": url}
@@ -558,18 +558,29 @@ def call_api_tool(provider_id: str, endpoint_template: str, params: dict) -> dic
     try:
         import urllib.request
         req = urllib.request.Request(url, headers={"User-Agent": "BFSI-PDF-QA/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         return {"text": f"API request failed: {e}", "url": url}
     return _parse_generic_search_response(raw, url)
 
 
+def _tool_error_result(provider: str, category: str) -> dict:
+    """Structured empty result on tool failure. Never blocks."""
+    return {
+        "tool": provider,
+        "category": category,
+        "text": "Tool failed or unavailable",
+        "url": "",
+        "error": True,
+    }
+
+
 def execute_external_tools(ready_providers: list, query: str, category: str) -> list:
     """
     Execute external tools for each ready provider.
-    Returns list of provenance-tagged snippets:
-    [{"type": "external", "tool": provider, "category": category, "url": url, "text": snippet}, ...]
+    All calls wrapped in try/except; on failure returns structured error result.
+    Returns list of provenance-tagged snippets or error results.
     """
     results = []
     for provider in ready_providers:
@@ -579,45 +590,51 @@ def execute_external_tools(ready_providers: list, query: str, category: str) -> 
         cat = category
         if config:
             cat = config.get("category", category)
-
-        if cat == "generic" or provider == "web_search_generic":
-            r = web_search_via_provider(query, provider)
-        else:
-            config = config or {}
-            endpoint_tpl = config.get("endpoint_template", "")
-            if endpoint_tpl:
-                creds = _resolve_credentials(provider, config.get("required_fields", [])) or {}
-                params = {"q": query, **creds}
-                r = call_api_tool(provider, endpoint_tpl, params)
-            else:
+        try:
+            if cat == "generic" or provider == "web_search_generic":
                 r = web_search_via_provider(query, provider)
+            else:
+                config = config or {}
+                endpoint_tpl = config.get("endpoint_template", "")
+                if endpoint_tpl:
+                    creds = _resolve_credentials(provider, config.get("required_fields", [])) or {}
+                    params = {"q": query, **creds}
+                    r = call_api_tool(provider, endpoint_tpl, params)
+                else:
+                    r = web_search_via_provider(query, provider)
 
-        text = r.get("text", "")
-        url = r.get("url", "")
-        if text and "not configured" not in text.lower() and "failed" not in text.lower():
-            results.append({
-                "type": "external",
-                "tool": provider,
-                "category": cat,
-                "url": url,
-                "text": text,
-                "fetched_at": datetime.utcnow().isoformat() + "Z",
-            })
-            break
-    if results and DEBUG:
+            text = r.get("text", "")
+            url = r.get("url", "")
+            if text and "not configured" not in text.lower() and "failed" not in text.lower():
+                results.append({
+                    "type": "external",
+                    "tool": provider,
+                    "category": cat,
+                    "url": url,
+                    "text": text,
+                    "fetched_at": datetime.utcnow().isoformat() + "Z",
+                })
+                break
+        except Exception as e:
+            if DEBUG:
+                print(f"[TOOLS] provider {provider} failed: {e}")
+            results.append(_tool_error_result(provider, cat))
+    if results and DEBUG and not any(r.get("error") for r in results):
         print(f"[TOOLS] Retrieved {len(results)} external snippets")
-    if not results and "web_search_generic" not in [p for p in ready_providers]:
-        if DEBUG:
-            print("[TOOLS] fallback to generic web search")
-        r = web_search_generic(query)
-        results.append({
-            "type": "external",
-            "tool": "web_search_generic",
-            "category": "generic",
-            "url": r.get("url", ""),
-            "text": r.get("text", ""),
-            "fetched_at": datetime.utcnow().isoformat() + "Z",
-        })
+    if not results or all(r.get("error") for r in results):
+        if "web_search_generic" not in ready_providers:
+            try:
+                r = web_search_generic(query)
+                results = [{
+                    "type": "external",
+                    "tool": "web_search_generic",
+                    "category": "generic",
+                    "url": r.get("url", ""),
+                    "text": r.get("text", ""),
+                    "fetched_at": datetime.utcnow().isoformat() + "Z",
+                }]
+            except Exception:
+                results = [_tool_error_result("web_search_generic", "generic")]
     return results
 
 

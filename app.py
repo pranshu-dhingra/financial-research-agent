@@ -97,8 +97,8 @@ def main():
             answer_text = ""
             result = None
             try:
-                from orchestrator import run_workflow_stream
-                for event in run_workflow_stream(question, pdf_path, max_chunks=5, timeout_sec=20):
+                from orchestrator import run_workflow_stream, safe_stream
+                for event in safe_stream(run_workflow_stream(question, pdf_path, max_chunks=5, timeout_sec=20)):
                     if event.get("type") == "log":
                         logbox.markdown("**" + event.get("message", "") + "**")
                     elif event.get("type") == "token":

@@ -21,6 +21,8 @@ ENABLE_RERANKER = os.environ.get("ENABLE_RERANKER", "0") == "1"
 DEFAULT_MAX_CHUNKS = 5
 DEFAULT_TOOL_TIMEOUT = 10
 DEFAULT_TOTAL_TIMEOUT = 20
+MAX_TOTAL_TIME = 30  # Global watchdog: never exceed
+FAILSAFE_ANSWER = "System could not retrieve sufficient evidence for this query."
 
 
 def _ts():
@@ -430,11 +432,45 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
     return result
 
 
+def safe_stream(generator):
+    """
+    Wrap generator to guarantee exactly one 'final' event.
+    If generator yields nothing or exits without final, emit failsafe final.
+    """
+    yielded = False
+    final_emitted = False
+    for event in generator:
+        yielded = True
+        yield event
+        if event.get("type") == "final":
+            final_emitted = True
+    if not final_emitted:
+        yield {
+            "type": "final",
+            "answer": FAILSAFE_ANSWER,
+            "confidence": 0.0,
+            "provenance": [],
+            "flags": [],
+            "trace": [{"agent": "system", "status": "error", "error": "empty generator"}],
+            "tool_calls": [],
+        }
+
+
 def _run_with_timeout(fn, timeout_sec, *args, **kwargs):
     """Run fn in thread with timeout. Returns result or raises FuturesTimeoutError."""
     with ThreadPoolExecutor(max_workers=1) as ex:
         future = ex.submit(fn, *args, **kwargs)
         return future.result(timeout=timeout_sec)
+
+
+def _append_trace(trace: list, agent: str, status: str, latency: float):
+    """Mandatory trace instrumentation: agent, status, latency, timestamp."""
+    trace.append({
+        "agent": agent,
+        "status": status,
+        "latency": round(latency, 3),
+        "timestamp": _ts(),
+    })
 
 
 def run_workflow_stream(
@@ -445,32 +481,43 @@ def run_workflow_stream(
 ):
     """
     Generator: yields structured events for Streamlit-compatible streaming.
+    ALWAYS emits exactly one 'final' event (via finally block).
     Events: {"type":"log","message":"..."} | {"type":"token","text":"..."} | {"type":"final",...} | {"type":"error","message":"..."}
-    Final event includes: answer, confidence, provenance, flags, trace, tool_calls
     """
     tool_timeout = min(DEFAULT_TOOL_TIMEOUT, timeout_sec - 5)
     step_timeout = max(2, (timeout_sec - tool_timeout) // 5)
+    budget = min(MAX_TOTAL_TIME, timeout_sec)
     trace = []
     tool_calls = []
+    final_answer = FAILSAFE_ANSWER
+    confidence = 0.0
+    provenance = []
+    verifier_flags = []
+    classifier_done = False
+    retriever_done = False
+    tool_done = False
+    synth_done = False
+    verifier_done = False
+    partials = []
+    external_provenance = []
+    prior_mem_text = None
 
-    def _trace(stage: str, start_ts: float):
-        end_ts = time.time()
-        trace.append({
-            "stage": stage,
-            "start": start_ts,
-            "end": end_ts,
-            "latency_seconds": round(end_ts - start_ts, 3),
-        })
+    def _check_timeout():
+        if time.time() - t0 > budget:
+            raise TimeoutError("Global timeout")
 
     try:
         t0 = time.time()
         yield {"type": "log", "message": "Classifying query..."}
         t_classifier = time.time()
+        _check_timeout()
         cls = classifier_agent(query, pdf_path)
-        _trace("classifier", t_classifier)
+        classifier_done = True
+        _append_trace(trace, "classifier", "ok", time.time() - t_classifier)
 
         yield {"type": "log", "message": "Retrieving internal chunks..."}
         t_retriever = time.time()
+        _check_timeout()
         try:
             partials = _run_with_timeout(
                 retriever_agent, step_timeout, query, pdf_path,
@@ -479,43 +526,44 @@ def run_workflow_stream(
             partials = partials[:max_chunks] if partials else []
         except FuturesTimeoutError:
             yield {"type": "error", "message": "System timed out (retriever)"}
-            return
-        _trace("retriever", t_retriever)
+            _append_trace(trace, "retriever", "timeout", time.time() - t_retriever)
+        else:
+            retriever_done = True
+            _append_trace(trace, "retriever", "ok", time.time() - t_retriever)
 
-        external_text = ""
-        external_provenance = []
-        if ENABLE_TOOL_AGENT and cls.get("external_needed", True):
+        if classifier_done and ENABLE_TOOL_AGENT and cls.get("external_needed", True):
             yield {"type": "log", "message": "Calling external tools..."}
-            t_tool_planner = time.time()
+            t_tool = time.time()
+            _check_timeout()
             try:
                 import tools
                 tool_plan = _run_with_timeout(
                     lambda: tools.tool_planner_agent(query, call_llm_fn=_call_llm()[0]),
                     step_timeout
                 )
-                _trace("tool_planner", t_tool_planner)
+                _append_trace(trace, "tool_planner", "ok", time.time() - t_tool)
                 providers = tool_plan.get("recommended_providers", [])
                 if providers:
                     resolved = tools.resolve_tool_credentials(tool_plan, input_fn=lambda: "SKIP")
                     ready = resolved.get("ready_providers", [])
                     tool_calls.extend(ready)
                     if ready:
-                        t_tool_exec = time.time()
-                        external_text, external_provenance = _run_with_timeout(
-                            tool_agent, tool_timeout, query
-                        )
-                        _trace("tool_execution", t_tool_exec)
-            except FuturesTimeoutError:
-                _trace("tool_planner", t_tool_planner)
-                pass
-            except Exception:
-                _trace("tool_planner", t_tool_planner)
-                pass
+                        t_exec = time.time()
+                        _check_timeout()
+                        try:
+                            external_text, external_provenance = _run_with_timeout(
+                                tool_agent, tool_timeout, query
+                            )
+                            tool_done = True
+                        except FuturesTimeoutError:
+                            external_provenance = []
+                        _append_trace(trace, "tool_agent", "ok" if tool_done else "timeout", time.time() - t_exec)
+            except (FuturesTimeoutError, Exception):
+                _append_trace(trace, "tool_planner", "error", time.time() - t_tool)
 
         from local_pdf_qa import load_memory_for_pdf, find_relevant_memories_semantic
         memory = load_memory_for_pdf(pdf_path)
         relevant_mem = find_relevant_memories_semantic(query, memory, top_k=5, pdf_path=pdf_path)
-        prior_mem_text = None
         if relevant_mem:
             prior_mem_text = "\n".join(
                 f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant_mem
@@ -523,129 +571,95 @@ def run_workflow_stream(
 
         synth_input_partials = partials
         if not partials and external_provenance:
-            synth_input_partials = [{"text": s.get("text", "")} for s in external_provenance]
+            synth_input_partials = [{"text": s.get("text", "")} for s in external_provenance if not s.get("error")]
 
-        if ENABLE_RERANKER and (synth_input_partials or external_provenance):
-            yield {"type": "log", "message": "Synthesizing answer (reranking)..."}
-            t_synth = time.time()
-            try:
-                from reranker import generate_candidate_answers, rank_candidates
-                synth_temp = synthesizer_agent(
-                    synth_input_partials, external_provenance, prior_mem_text, query, use_streaming=False
-                )
-                candidates = generate_candidate_answers(
-                    query, synth_input_partials, external_provenance, prior_mem_text, n=3
-                )
-                best_answer = rank_candidates(
-                    query, candidates,
-                    provenance=synth_temp["provenance"],
-                    partials=partials,
-                    external_snippets=external_provenance,
-                )
-                synth = {"answer": best_answer, "provenance": synth_temp["provenance"]}
-                _trace("synthesizer", t_synth)
-            except ImportError:
-                answer_acc = ""
-                yield {"type": "log", "message": "Synthesizing answer..."}
-                for ev in synthesizer_agent_stream(
-                    synth_input_partials, external_provenance, prior_mem_text, query
-                ):
-                    if ev.get("type") == "token":
-                        answer_acc += ev.get("text", "")
-                        yield ev
-                    else:
-                        yield ev
-                provenance = []
-                for p in partials:
-                    if isinstance(p, dict):
-                        provenance.append({
-                            "type": "internal", "source": "pdf", "page": p.get("page"),
-                            "tool": None, "category": None, "text": p.get("text", "")[:500],
-                            "similarity": p.get("similarity"),
-                        })
-                for s in external_provenance:
-                    provenance.append({
-                        "type": "external", "source": s.get("url", ""), "page": None,
-                        "tool": s.get("tool"), "category": s.get("category"),
-                        "text": s.get("text", "")[:500], "similarity": None,
-                    })
-                synth = {"answer": answer_acc.strip() or "Insufficient evidence.", "provenance": provenance}
-                _trace("synthesizer", t_synth)
-        else:
-            answer_acc = ""
-            yield {"type": "log", "message": "Synthesizing answer..."}
-            t_synth = time.time()
-            for ev in synthesizer_agent_stream(
-                synth_input_partials, external_provenance, prior_mem_text, query
-            ):
-                if ev.get("type") == "token":
-                    answer_acc += ev.get("text", "")
-                    yield ev
-                else:
-                    yield ev
-            provenance = []
-            for p in partials:
-                if isinstance(p, dict):
-                    provenance.append({
-                        "type": "internal", "source": "pdf", "page": p.get("page"),
-                        "tool": None, "category": None, "text": p.get("text", "")[:500],
-                        "similarity": p.get("similarity"),
-                    })
-            for s in external_provenance:
+        yield {"type": "log", "message": "Synthesizing answer..."}
+        t_synth = time.time()
+        _check_timeout()
+        answer_acc = ""
+        for ev in synthesizer_agent_stream(
+            synth_input_partials, external_provenance, prior_mem_text, query
+        ):
+            if ev.get("type") == "token":
+                answer_acc += ev.get("text", "")
+                yield ev
+        provenance = []
+        for p in partials:
+            if isinstance(p, dict):
                 provenance.append({
-                    "type": "external", "source": s.get("url", ""), "page": None,
-                    "tool": s.get("tool"), "category": s.get("category"),
-                    "text": s.get("text", "")[:500], "similarity": None,
+                    "type": "internal", "source": "pdf", "page": p.get("page"),
+                    "tool": None, "category": None, "text": p.get("text", "")[:500],
+                    "similarity": p.get("similarity"),
                 })
-            for p in provenance:
-                p.setdefault("type", "internal")
-                p.setdefault("source", "pdf")
-                p.setdefault("page", None)
-                p.setdefault("tool", None)
-                p.setdefault("category", None)
-                p.setdefault("text", "")
-                p.setdefault("similarity", None)
-            synth = {"answer": answer_acc.strip() or "Insufficient evidence.", "provenance": provenance}
-            _trace("synthesizer", t_synth)
+        for s in external_provenance:
+            provenance.append({
+                "type": "external", "source": s.get("url", ""), "page": None,
+                "tool": s.get("tool"), "category": s.get("category"),
+                "text": s.get("text", "")[:500], "similarity": None,
+            })
+        for p in provenance:
+            p.setdefault("type", "internal")
+            p.setdefault("source", "pdf")
+            p.setdefault("page", None)
+            p.setdefault("tool", None)
+            p.setdefault("category", None)
+            p.setdefault("text", "")
+            p.setdefault("similarity", None)
+        synth_done = True
+        final_answer = answer_acc.strip() or "Insufficient evidence. No relevant internal or external sources found."
+        _append_trace(trace, "synthesizer", "ok", time.time() - t_synth)
 
         yield {"type": "log", "message": "Verifying answer..."}
         t_verifier = time.time()
-        ver = _verifier_agent(
-            synth["answer"], synth["provenance"], partials, external_provenance
-        )
-        _trace("verifier", t_verifier)
+        ver = _verifier_agent(final_answer, provenance, partials, external_provenance)
+        verifier_done = True
+        confidence = ver["confidence"]
+        verifier_flags = ver.get("flags", [])
+        _append_trace(trace, "verifier", "ok", time.time() - t_verifier)
 
         yield {"type": "log", "message": "Saving to memory..."}
         t_memory = time.time()
         if os.environ.get("SAVE_MEMORY", "1") != "0":
-            from local_pdf_qa import get_embedding, append_memory_for_pdf
-            emb = get_embedding(synth["answer"])
-            entry = {
-                "id": str(uuid.uuid4()),
-                "timestamp": _ts(),
-                "pdf_path": os.path.abspath(pdf_path),
-                "question": query,
-                "answer": synth["answer"],
-                "confidence": ver["confidence"],
-                "flags": ver.get("flags", []),
-                "provenance": synth["provenance"],
-                "embedding": emb,
-                "model_id": os.environ.get("MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0"),
-            }
-            append_memory_for_pdf(entry, pdf_path)
-        _trace("memory_write", t_memory)
+            try:
+                from local_pdf_qa import get_embedding, append_memory_for_pdf
+                emb = get_embedding(final_answer)
+                entry = {
+                    "id": str(uuid.uuid4()),
+                    "timestamp": _ts(),
+                    "pdf_path": os.path.abspath(pdf_path),
+                    "question": query,
+                    "answer": final_answer,
+                    "confidence": confidence,
+                    "flags": verifier_flags,
+                    "provenance": provenance,
+                    "embedding": emb,
+                    "model_id": os.environ.get("MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0"),
+                }
+                append_memory_for_pdf(entry, pdf_path)
+            except Exception:
+                pass
+        _append_trace(trace, "memory", "ok", time.time() - t_memory)
+        trace.append({"agent": "total", "status": "ok", "latency": round(time.time() - t0, 3), "timestamp": _ts()})
 
-        total_latency = round(time.time() - t0, 3)
-        trace.append({"stage": "total", "start": t0, "end": time.time(), "latency_seconds": total_latency})
-
+    except TimeoutError as e:
+        yield {"type": "error", "message": str(e)}
+        final_answer = FAILSAFE_ANSWER
+        confidence = 0.0
+        provenance = []
+        verifier_flags = []
+    except Exception as e:
+        yield {"type": "error", "message": str(e)}
+        final_answer = FAILSAFE_ANSWER
+        confidence = 0.0
+        provenance = []
+        verifier_flags = []
+    finally:
         yield {
             "type": "final",
-            "answer": synth["answer"],
-            "confidence": ver["confidence"],
-            "provenance": synth["provenance"],
-            "flags": ver.get("flags", []),
+            "answer": final_answer,
+            "confidence": confidence,
+            "provenance": provenance,
+            "flags": verifier_flags,
             "trace": trace,
             "tool_calls": tool_calls,
         }
-    except Exception as e:
-        yield {"type": "error", "message": "Agent failed. Try reducing query complexity."}

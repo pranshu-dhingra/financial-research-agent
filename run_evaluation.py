@@ -30,10 +30,11 @@ def resolve_pdf_path(pdf_name: str) -> str | None:
 
 def run_single_query(query_spec: dict, timeout_sec: int = 30) -> dict:
     """
-    Run one evaluation query via run_workflow_stream.
-    Returns result dict with metrics and validation.
+    Run one evaluation query via run_workflow_stream wrapped in safe_stream.
+    Consumes stream via safe_stream; asserts final event exists.
+    Never waits indefinitely.
     """
-    from orchestrator import run_workflow_stream
+    from orchestrator import run_workflow_stream, safe_stream
 
     pdf_name = query_spec.get("pdf", "")
     question = query_spec.get("question", "")
@@ -51,35 +52,33 @@ def run_single_query(query_spec: dict, timeout_sec: int = 30) -> dict:
 
     streamed_tokens = []
     final_event = None
-    trace = []
-    tool_calls = []
+    all_events = []
     internal_sources = 0
     external_sources = 0
     confidence = 0.0
     verifier_flags = []
     provenance = []
+    trace = []
+    tool_calls = []
 
     t_start = time.time()
     try:
-        for event in run_workflow_stream(
-            question, pdf_path, max_chunks=5, timeout_sec=min(timeout_sec, 25)
-        ):
+        stream = safe_stream(
+            run_workflow_stream(
+                question, pdf_path, max_chunks=5, timeout_sec=min(timeout_sec, 25)
+            )
+        )
+        for event in stream:
             if time.time() - t_start > timeout_sec:
                 break
+            all_events.append(event)
             if event.get("type") == "token":
                 streamed_tokens.append(event.get("text", ""))
             elif event.get("type") == "final":
                 final_event = event
                 break
             elif event.get("type") == "error":
-                return {
-                    "pdf": pdf_name,
-                    "question": question,
-                    "expected_type": expected_type,
-                    "error": event.get("message", "Unknown error"),
-                    "latency_seconds": round(time.time() - t_start, 2),
-                    "validation_passed": False,
-                }
+                pass  # Continue to consume; safe_stream guarantees final
     except Exception as e:
         return {
             "pdf": pdf_name,
