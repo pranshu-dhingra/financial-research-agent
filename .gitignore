@@ -20,3 +20,9 @@ venv/
 # IDE
 .idea/
 .vscode/
+# Test artifacts
+test_confidence_minimal.py
+
+# OS
+.DS_Store
+Thumbs.db
