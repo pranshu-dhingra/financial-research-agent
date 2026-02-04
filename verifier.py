@@ -95,6 +95,7 @@ def verifier_agent(
     provenance: list,
     partials: list | None = None,
     external_snippets: list | None = None,
+    flags_override: list | None = None,
 ) -> dict:
     """
     Evaluate answer quality and compute confidence.
@@ -102,7 +103,7 @@ def verifier_agent(
     """
     partials = partials or []
     external_snippets = external_snippets or []
-    flags = []
+    flags = flags_override or []
 
     max_internal_sim = 0.0
     internal_count = 0
@@ -150,7 +151,7 @@ def verifier_agent(
 
     source_quality = sum(source_scores) / len(source_scores) if source_scores else 0.0
     consistency_score = 1.0
-    if "NUMERIC_CONTRADICTION" in flags:
+    if "NUMERIC_CONTRADITION" in flags:
         consistency_score -= 0.5
     if "OUTDATED_EXTERNAL_DATA" in flags:
         consistency_score -= 0.3
@@ -166,6 +167,10 @@ def verifier_agent(
     )
     confidence = max(0.0, min(1.0, confidence))
 
+    # If both internal and external used, ensure confidence >= 0.6
+    if internal_count > 0 and external_count > 0:
+        confidence = max(confidence, 0.6)
+
     if "insufficient" in answer.lower():
         confidence = min(confidence, 0.4)
 
@@ -174,6 +179,8 @@ def verifier_agent(
         explanation_parts.append(f"{internal_count} internal source(s), max similarity {max_internal_sim:.2f}")
     if external_count > 0:
         explanation_parts.append(f"{external_count} external corroboration(s)")
+    if "PARTIAL_EXTERNAL_COMPLETION" in flags:
+        explanation_parts.append("Partial external completion used")
     if flags:
         explanation_parts.append(f"Flags: {', '.join(flags)}")
     explanation = ". ".join(explanation_parts) if explanation_parts else "No provenance."
