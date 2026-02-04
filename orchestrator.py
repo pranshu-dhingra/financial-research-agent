@@ -119,6 +119,43 @@ def run_workflow(question: str, pdf_path: str, use_streaming: bool = True) -> di
             })
     
     if not partials:
+        # No internal evidence, force external lookup
+        external_context = None
+        external_provenance = []
+        if os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1":
+            try:
+                import tools
+                print(f"[DEBUG] No internal evidence, calling SerpAPI for: {question}")
+                plan = tools.tool_planner_agent(question, call_llm_fn=call_bedrock_stream)
+                providers = plan.get("recommended_providers", [])
+                if providers:
+                    print("Fetching external data...")
+                    external_context, external_provenance = tools.run_external_search(
+                        question, call_llm_fn=call_bedrock_stream
+                    )
+                    if external_context and external_context.strip():
+                        print("External data retrieved.")
+                        # Synthesize from external only
+                        final_answer = call_bedrock_stream(
+                            make_synthesis_prompt([external_context], question, prior_mem_text, external_context=None, external_provenance=external_provenance)
+                        )
+                        if final_answer and final_answer.strip():
+                            # Add external provenance
+                            for p in external_provenance:
+                                provenance.append(p)
+                            # Verify
+                            verification = verifier_agent(final_answer, provenance, [], external_provenance)
+                            # Ensure confidence >= 0.6 for external-only
+                            verification["confidence"] = max(verification["confidence"], 0.6)
+                            return {
+                                "answer": final_answer,
+                                "provenance": provenance,
+                                "confidence": verification["confidence"],
+                                "flags": verification["flags"],
+                            }
+            except Exception as e:
+                print(f"[DEBUG] external lookup failed: {e}")
+        # Fallback
         return {
             "answer": "Not found in document",
             "provenance": provenance,
@@ -141,7 +178,7 @@ def run_workflow(question: str, pdf_path: str, use_streaming: bool = True) -> di
     external_context = None
     external_provenance = []
     
-    if (internal_partial or missing_entities) and ENABLE_TOOL_PLANNER:
+    if (internal_partial or missing_entities) and os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1":
         try:
             import tools
             print(f"[DEBUG] Calling SerpAPI for original query: {question}")
