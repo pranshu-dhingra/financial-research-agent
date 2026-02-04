@@ -706,3 +706,23 @@ def run_external_search(query: str, call_llm_fn=None, input_fn=None):
     snippets = execute_external_tools(ready, query, category)
     text_parts = [s.get("text", "") for s in snippets if s.get("text")]
     return "\n\n".join(text_parts), snippets
+
+
+def run_external_search_forced(query: str, call_llm_fn=None):
+    """
+    Force external search via SerpAPI regardless of planner recommendation.
+    Used when no internal evidence is found.
+    Returns (combined_external_text, provenance_list).
+    """
+    # Directly execute SerpAPI without consulting planner
+    category = "generic"
+    ready_providers = ["serpapi"]
+    
+    # Verify SerpAPI is configured
+    config = get_provider_config("serpapi")
+    if not config:
+        ready_providers = ["web_search_generic"]
+    
+    snippets = execute_external_tools(ready_providers, query, category)
+    text_parts = [s.get("text", "") for s in snippets if s.get("text")]
+    return "\n\n".join(text_parts), snippets
