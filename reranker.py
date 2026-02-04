@@ -15,9 +15,9 @@ VARIATIONS = [
 
 def generate_candidate_answers(
     query: str,
-    partials: list,
-    external_snippets: list,
-    prior_mem_text: str | None,
+    internal_facts: list,
+    external_facts: list,
+    memory_facts: list,
     n: int = 3,
 ) -> list[str]:
     """
@@ -30,9 +30,9 @@ def generate_candidate_answers(
     for i in range(n):
         var = VARIATIONS[i % len(VARIATIONS)] if i < len(VARIATIONS) else None
         synth = synthesizer_agent(
-            partials,
-            external_snippets,
-            prior_mem_text,
+            internal_facts,
+            external_facts,
+            memory_facts,
             query,
             use_streaming=False,
             variation=var,

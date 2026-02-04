@@ -25,26 +25,26 @@ class TestExternalFallback(unittest.TestCase):
         self.assertIn("text", external_snippet)
 
     def test_synthesizer_merges_external_provenance(self):
-        """Synthesizer agent includes external snippets in provenance."""
+        """Synthesizer agent uses external facts but does not emit provenance labels."""
         from orchestrator import synthesizer_agent
 
-        partials = []
-        external_snippets = [
-            {"type": "external", "tool": "web_search", "category": "generic", "text": "External answer", "url": "https://x.com"},
+        internal_facts = []
+        external_facts = [
+            {"tool": "web_search", "category": "generic", "text": "External answer", "url": "https://x.com"},
         ]
+        memory_facts = []
         with patch("orchestrator._call_llm") as mock_llm:
             mock_sync = MagicMock(return_value="Synthesized answer from external source.")
             mock_stream = MagicMock(return_value="Synthesized answer from external source.")
             mock_llm.return_value = (mock_sync, mock_stream)
             result = synthesizer_agent(
-                partials, external_snippets, None, "What is GDP?",
+                internal_facts, external_facts, memory_facts, "What is GDP?",
                 use_streaming=False,
             )
             self.assertIn("answer", result)
-            self.assertIn("provenance", result)
-            ext_prov = [p for p in result["provenance"] if p.get("type") == "external"]
-            self.assertGreater(len(ext_prov), 0)
-            self.assertEqual(ext_prov[0]["tool"], "web_search")
+            ans = result["answer"]
+            self.assertNotIn("[INTERNAL]", ans)
+            self.assertNotIn("[EXTERNAL]", ans)
 
 
 if __name__ == "__main__":

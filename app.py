@@ -41,8 +41,6 @@ def main():
     st.set_page_config(page_title="BFSI Research Assistant", layout="wide")
     st.title("BFSI Research Assistant")
 
-    load_memory_for_pdf, clear_memory_for_pdf, precompute_pdf_embeddings = _ensure_imports()
-
     pdfs = list_uploaded_pdfs()
     pdf_options = [str(p) for p in pdfs]
     if not pdf_options:
@@ -56,6 +54,7 @@ def main():
             with open(dest, "wb") as f:
                 f.write(uploaded.getvalue())
             try:
+                _, _, precompute_pdf_embeddings = _ensure_imports()
                 precompute_pdf_embeddings(str(dest))
             except Exception as e:
                 st.error(f"Precompute failed: {e}")
@@ -75,6 +74,7 @@ def main():
         col1, col2 = st.sidebar.columns(2)
         if col1.button("Yes, Clear", key="clear_yes"):
             try:
+                _, clear_memory_for_pdf, _ = _ensure_imports()
                 clear_memory_for_pdf(pdf_path)
                 st.sidebar.success("Memory cleared.")
             except Exception as e:
@@ -98,7 +98,7 @@ def main():
             result = None
             try:
                 from orchestrator import run_workflow_stream, safe_stream
-                for event in safe_stream(run_workflow_stream(question, pdf_path, max_chunks=5, timeout_sec=20)):
+                for event in safe_stream(run_workflow_stream(question, pdf_path, max_chunks=5, timeout_sec=90)):
                     if event.get("type") == "log":
                         logbox.markdown("**" + event.get("message", "") + "**")
                     elif event.get("type") == "token":
@@ -128,7 +128,7 @@ def main():
                             "category": p.get("category", ""),
                             "snippet": (p.get("text", "") or "")[:200] + ("..." if len(p.get("text", "") or "") > 200 else ""),
                         })
-                    st.dataframe(rows, use_container_width=True)
+                    st.dataframe(rows, width="stretch")
                 else:
                     st.write("No sources.")
                 st.subheader("Confidence")
@@ -143,6 +143,7 @@ def main():
                 if result.get("flags"):
                     st.caption(f"Flags: {', '.join(result.get('flags', []))}")
         else:
+            load_memory_for_pdf, _, _ = _ensure_imports()
             memory = load_memory_for_pdf(pdf_path)
             if not memory:
                 st.info("No stored Q&As for this PDF. Run live analysis to build memory.")
@@ -161,6 +162,7 @@ def main():
     if st.session_state.get("show_memory"):
         pdf_path = st.session_state["show_memory"]
         st.subheader(f"Memory: {os.path.basename(pdf_path)}")
+        load_memory_for_pdf, _, _ = _ensure_imports()
         memory = load_memory_for_pdf(pdf_path)
         if not memory:
             st.write("No stored Q&As.")
@@ -173,7 +175,7 @@ def main():
                     "confidence": m.get("confidence", 0),
                     "timestamp": m.get("timestamp", ""),
                 })
-            st.dataframe(rows, use_container_width=True)
+            st.dataframe(rows, width="stretch")
             for m in memory:
                 with st.expander(f"Q: {m.get('question', '')[:60]}..."):
                     st.write("**Answer:**", m.get("answer", ""))

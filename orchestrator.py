@@ -149,47 +149,91 @@ def tool_agent(query: str, input_fn=None) -> tuple:
 
 
 def synthesizer_agent(
-    partials: list,
-    external_snippets: list,
-    prior_mem_text: str | None,
+    internal_facts: list,
+    external_facts: list,
+    memory_facts: list,
     question: str,
     use_streaming: bool = True,
     variation: str | None = None,
 ) -> dict:
     """
-    Merge internal partials + external evidence. Labels [INTERNAL]/[EXTERNAL].
-    Returns: {answer, provenance}
+    Merge internal facts + external evidence + prior memory into one answer.
+    LLM does NOT emit provenance labels; provenance is system-enforced by orchestrator.
+    Returns: {"answer": ...}
     """
     from local_pdf_qa import call_bedrock, call_bedrock_stream
 
-    if not partials and not external_snippets:
+    if not internal_facts and not external_facts and not memory_facts:
         return {
             "answer": "Insufficient evidence. No relevant internal or external sources found.",
-            "provenance": [],
         }
-    partial_texts = [p.get("text", p) if isinstance(p, dict) else str(p) for p in partials]
-    if not partial_texts and external_snippets:
-        partial_texts = [s.get("text", "") for s in external_snippets if s.get("text")]
-    external_context = "\n\n".join(s.get("text", "") for s in external_snippets if s.get("text"))
+
+    # Build structured sections for the prompt
+    def _fmt_internal():
+        lines = []
+        for f in internal_facts:
+            text = f.get("text", "") or ""
+            page = f.get("page")
+            sim = f.get("similarity")
+            meta_parts = []
+            if page is not None:
+                meta_parts.append(f"page {page}")
+            if sim is not None:
+                try:
+                    meta_parts.append(f"similarity {float(sim):.2f}")
+                except (TypeError, ValueError):
+                    pass
+            meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"- {text}{meta}")
+        return "\n".join(lines) if lines else "None."
+
+    def _fmt_external():
+        lines = []
+        for f in external_facts:
+            text = f.get("text", "") or ""
+            url = f.get("url", "") or ""
+            tool = f.get("tool")
+            meta_parts = []
+            if url:
+                meta_parts.append(url)
+            if tool:
+                meta_parts.append(f"tool={tool}")
+            meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"- {text}{meta}")
+        return "\n".join(lines) if lines else "None."
+
+    def _fmt_memory():
+        lines = []
+        for f in memory_facts:
+            text = f.get("text", "") or ""
+            ts = f.get("timestamp")
+            meta = f" (timestamp {ts})" if ts else ""
+            lines.append(f"- {text}{meta}")
+        return "\n".join(lines) if lines else "None."
+
+    internal_block = _fmt_internal()
+    external_block = _fmt_external()
+    memory_block = _fmt_memory()
+
     prompt = (
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-        "You are synthesizing an investment research answer.\n"
-        "Label every factual sentence as [INTERNAL] or [EXTERNAL].\n"
-        "Cite page numbers or URLs where applicable.\n"
-        "If evidence insufficient, say so. Do not invent facts.\n"
+        "You are synthesizing a financial research answer.\n"
+        "Use ONLY the provided facts.\n"
+        "Do NOT add any provenance labels.\n"
+        "Do NOT write [INTERNAL] or [EXTERNAL].\n"
+        "Just write the answer text.\n"
     )
     if variation:
         prompt += f"\n{variation}\n\n"
     else:
         prompt += "\n\n"
-    if prior_mem_text:
-        prompt += f"PAST INTERACTIONS:\n{prior_mem_text}\n\n"
-    if external_context:
-        prompt += f"EXTERNAL CONTEXT:\n{external_context}\n\n"
-    prompt += "PARTIAL ANSWERS:\n"
-    for i, p in enumerate(partial_texts, 1):
-        prompt += f"\nPARTIAL {i}: {p}"
-    prompt += f"\n\nFINAL QUESTION:\n{question}\n\nFINAL ANSWER:\n"
+    prompt += "INTERNAL FACTS:\n"
+    prompt += internal_block + "\n\n"
+    prompt += "EXTERNAL FACTS:\n"
+    prompt += external_block + "\n\n"
+    prompt += "PRIOR MEMORY:\n"
+    prompt += memory_block + "\n\n"
+    prompt += f"QUESTION:\n{question}\n\nANSWER:\n"
     prompt += "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
     call_sync, call_stream = _call_llm()
     call_fn = call_stream if use_streaming else call_sync
@@ -200,35 +244,13 @@ def synthesizer_agent(
     answer = (answer or "").strip()
     if not answer:
         answer = "Insufficient evidence. No relevant internal or external sources found."
-    provenance = []
-    for p in partials:
-        if isinstance(p, dict):
-            provenance.append({
-                "type": "internal",
-                "source": "pdf",
-                "page": p.get("page"),
-                "tool": None,
-                "category": None,
-                "text": p.get("text", "")[:500],
-                "similarity": p.get("similarity"),
-            })
-    for s in external_snippets:
-        provenance.append({
-            "type": "external",
-            "source": s.get("url", ""),
-            "page": None,
-            "tool": s.get("tool"),
-            "category": s.get("category"),
-            "text": s.get("text", "")[:500],
-            "similarity": None,
-        })
-    return {"answer": answer, "provenance": provenance}
+    return {"answer": answer}
 
 
 def synthesizer_agent_stream(
-    partials: list,
-    external_snippets: list,
-    prior_mem_text: str | None,
+    internal_facts: list,
+    external_facts: list,
+    memory_facts: list,
     question: str,
     variation: str | None = None,
 ):
@@ -238,32 +260,74 @@ def synthesizer_agent_stream(
     """
     from local_pdf_qa import call_bedrock_stream_gen, call_bedrock
 
-    if not partials and not external_snippets:
+    if not internal_facts and not external_facts and not memory_facts:
         yield {"type": "token", "text": "Insufficient evidence. No relevant internal or external sources found."}
         return
-    partial_texts = [p.get("text", p) if isinstance(p, dict) else str(p) for p in partials]
-    if not partial_texts and external_snippets:
-        partial_texts = [s.get("text", "") for s in external_snippets if s.get("text")]
-    external_context = "\n\n".join(s.get("text", "") for s in external_snippets if s.get("text"))
+
+    def _fmt_internal():
+        lines = []
+        for f in internal_facts:
+            text = f.get("text", "") or ""
+            page = f.get("page")
+            sim = f.get("similarity")
+            meta_parts = []
+            if page is not None:
+                meta_parts.append(f"page {page}")
+            if sim is not None:
+                try:
+                    meta_parts.append(f"similarity {float(sim):.2f}")
+                except (TypeError, ValueError):
+                    pass
+            meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"- {text}{meta}")
+        return "\n".join(lines) if lines else "None."
+
+    def _fmt_external():
+        lines = []
+        for f in external_facts:
+            text = f.get("text", "") or ""
+            url = f.get("url", "") or ""
+            tool = f.get("tool")
+            meta_parts = []
+            if url:
+                meta_parts.append(url)
+            if tool:
+                meta_parts.append(f"tool={tool}")
+            meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
+            lines.append(f"- {text}{meta}")
+        return "\n".join(lines) if lines else "None."
+
+    def _fmt_memory():
+        lines = []
+        for f in memory_facts:
+            text = f.get("text", "") or ""
+            ts = f.get("timestamp")
+            meta = f" (timestamp {ts})" if ts else ""
+            lines.append(f"- {text}{meta}")
+        return "\n".join(lines) if lines else "None."
+
+    internal_block = _fmt_internal()
+    external_block = _fmt_external()
+    memory_block = _fmt_memory()
     prompt = (
         "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
-        "You are synthesizing an investment research answer.\n"
-        "Label every factual sentence as [INTERNAL] or [EXTERNAL].\n"
-        "Cite page numbers or URLs where applicable.\n"
-        "If evidence insufficient, say so. Do not invent facts.\n"
+        "You are synthesizing a financial research answer.\n"
+        "Use ONLY the provided facts.\n"
+        "Do NOT add any provenance labels.\n"
+        "Do NOT write [INTERNAL] or [EXTERNAL].\n"
+        "Just write the answer text.\n"
     )
     if variation:
         prompt += f"\n{variation}\n\n"
     else:
         prompt += "\n\n"
-    if prior_mem_text:
-        prompt += f"PAST INTERACTIONS:\n{prior_mem_text}\n\n"
-    if external_context:
-        prompt += f"EXTERNAL CONTEXT:\n{external_context}\n\n"
-    prompt += "PARTIAL ANSWERS:\n"
-    for i, p in enumerate(partial_texts, 1):
-        prompt += f"\nPARTIAL {i}: {p}"
-    prompt += f"\n\nFINAL QUESTION:\n{question}\n\nFINAL ANSWER:\n"
+    prompt += "INTERNAL FACTS:\n"
+    prompt += internal_block + "\n\n"
+    prompt += "EXTERNAL FACTS:\n"
+    prompt += external_block + "\n\n"
+    prompt += "PRIOR MEMORY:\n"
+    prompt += memory_block + "\n\n"
+    prompt += f"QUESTION:\n{question}\n\nANSWER:\n"
     prompt += "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
     try:
         for piece in call_bedrock_stream_gen(prompt):
@@ -337,71 +401,95 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
     from local_pdf_qa import load_memory_for_pdf, find_relevant_memories_semantic
     memory = load_memory_for_pdf(pdf_path)
     relevant_mem = find_relevant_memories_semantic(query, memory, top_k=5, pdf_path=pdf_path)
-    prior_mem_text = None
-    if relevant_mem:
-        prior_mem_text = "\n".join(
-            f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant_mem
-        )
 
-    synth_input_partials = partials
-    if not partials and external_provenance:
-        synth_input_partials = [{"text": s.get("text", "")} for s in external_provenance]
+    # Build structured fact lists for synthesizer
+    internal_facts = []
+    for p in partials:
+        if isinstance(p, dict):
+            internal_facts.append({
+                "text": p.get("text", ""),
+                "page": p.get("page"),
+                "similarity": p.get("similarity"),
+            })
+    external_facts = []
+    for s in external_provenance:
+        external_facts.append({
+            "text": s.get("text", ""),
+            "url": s.get("url", ""),
+            "tool": s.get("tool"),
+            "category": s.get("category"),
+        })
+    memory_facts = []
+    for m in relevant_mem or []:
+        memory_facts.append({
+            "text": f"Q: {m.get('question')}\nA: {m.get('answer')}",
+            "timestamp": m.get("timestamp"),
+        })
 
     if ENABLE_RERANKER and (synth_input_partials or external_provenance):
         try:
             from reranker import generate_candidate_answers, rank_candidates
             candidates = generate_candidate_answers(
-                query, synth_input_partials, external_provenance, prior_mem_text, n=3
-            )
-            synth_temp = synthesizer_agent(
-                synth_input_partials, external_provenance, prior_mem_text, query, use_streaming=False
+                query, internal_facts, external_facts, memory_facts, n=3
             )
             best_answer = rank_candidates(
                 query, candidates,
-                provenance=synth_temp["provenance"],
+                provenance=[],
                 partials=partials,
                 external_snippets=external_provenance,
             )
             synth = {
                 "answer": best_answer,
-                "provenance": synthesizer_agent(
-                    synth_input_partials, external_provenance, prior_mem_text, query, use_streaming=False
-                )["provenance"],
+                "provenance": [],  # provenance will be built system-side below
             }
             trace.append({"agent": "synthesizer", "notes": "reranked from 3 candidates", "timestamp": _ts()})
         except ImportError:
             synth = synthesizer_agent(
-                synth_input_partials,
-                external_provenance,
-                prior_mem_text,
+                internal_facts,
+                external_facts,
+                memory_facts,
                 query,
                 use_streaming=use_streaming,
             )
             trace.append({"agent": "synthesizer", "notes": "merged internal + external", "timestamp": _ts()})
     else:
         synth = synthesizer_agent(
-            synth_input_partials,
-            external_provenance,
-            prior_mem_text,
+            internal_facts,
+            external_facts,
+            memory_facts,
             query,
             use_streaming=use_streaming,
         )
         trace.append({"agent": "synthesizer", "notes": "merged internal + external", "timestamp": _ts()})
 
+    # System-level provenance injection (authoritative)
+    provenance = []
+    abs_pdf = os.path.abspath(pdf_path)
+    for f in internal_facts:
+        provenance.append({
+            "type": "internal",
+            "source": abs_pdf,
+            "page": f.get("page"),
+            "tool": None,
+            "category": None,
+            "text": (f.get("text", "") or "")[:500],
+            "similarity": f.get("similarity"),
+        })
+    for f in external_facts:
+        provenance.append({
+            "type": "external",
+            "source": f.get("url", ""),
+            "page": None,
+            "tool": f.get("tool"),
+            "category": f.get("category"),
+            "text": (f.get("text", "") or "")[:500],
+            "similarity": None,
+        })
+
     ver = _verifier_agent(
-        synth["answer"], synth["provenance"], partials, external_provenance
+        synth["answer"], provenance, partials, external_provenance
     )
     trace.append({"agent": "verifier", "confidence": ver["confidence"], "timestamp": _ts()})
-
-    provenance = synth["provenance"]
-    for p in provenance:
-        p.setdefault("type", "internal")
-        p.setdefault("source", "pdf")
-        p.setdefault("page", None)
-        p.setdefault("tool", None)
-        p.setdefault("category", None)
-        p.setdefault("text", "")
-        p.setdefault("similarity", None)
 
     flags = ver.get("flags", [])
     result = {
@@ -484,8 +572,9 @@ def run_workflow_stream(
     ALWAYS emits exactly one 'final' event (via finally block).
     Events: {"type":"log","message":"..."} | {"type":"token","text":"..."} | {"type":"final",...} | {"type":"error","message":"..."}
     """
-    tool_timeout = min(DEFAULT_TOOL_TIMEOUT, timeout_sec - 5)
-    step_timeout = max(2, (timeout_sec - tool_timeout) // 5)
+    tool_timeout = min(DEFAULT_TOOL_TIMEOUT, timeout_sec - 10)
+    step_timeout = max(10, (timeout_sec - tool_timeout) // 4)
+    retriever_timeout = min(45, max(step_timeout, timeout_sec - 15))
     budget = min(MAX_TOTAL_TIME, timeout_sec)
     trace = []
     tool_calls = []
@@ -520,7 +609,7 @@ def run_workflow_stream(
         _check_timeout()
         try:
             partials = _run_with_timeout(
-                retriever_agent, step_timeout, query, pdf_path,
+                retriever_agent, retriever_timeout, query, pdf_path,
                 **{"use_streaming": False}
             )
             partials = partials[:max_chunks] if partials else []
@@ -564,47 +653,66 @@ def run_workflow_stream(
         from local_pdf_qa import load_memory_for_pdf, find_relevant_memories_semantic
         memory = load_memory_for_pdf(pdf_path)
         relevant_mem = find_relevant_memories_semantic(query, memory, top_k=5, pdf_path=pdf_path)
-        if relevant_mem:
-            prior_mem_text = "\n".join(
-                f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant_mem
-            )
 
-        synth_input_partials = partials
-        if not partials and external_provenance:
-            synth_input_partials = [{"text": s.get("text", "")} for s in external_provenance if not s.get("error")]
+        # Build structured fact lists for synthesizer
+        internal_facts = []
+        for p in partials:
+            if isinstance(p, dict):
+                internal_facts.append({
+                    "text": p.get("text", ""),
+                    "page": p.get("page"),
+                    "similarity": p.get("similarity"),
+                })
+        external_facts = []
+        for s in external_provenance:
+            if s.get("error"):
+                continue
+            external_facts.append({
+                "text": s.get("text", ""),
+                "url": s.get("url", ""),
+                "tool": s.get("tool"),
+                "category": s.get("category"),
+            })
+        memory_facts = []
+        for m in relevant_mem or []:
+            memory_facts.append({
+                "text": f"Q: {m.get('question')}\nA: {m.get('answer')}",
+                "timestamp": m.get("timestamp"),
+            })
 
         yield {"type": "log", "message": "Synthesizing answer..."}
         t_synth = time.time()
         _check_timeout()
         answer_acc = ""
         for ev in synthesizer_agent_stream(
-            synth_input_partials, external_provenance, prior_mem_text, query
+            internal_facts, external_facts, memory_facts, query
         ):
             if ev.get("type") == "token":
                 answer_acc += ev.get("text", "")
                 yield ev
+        # System-level provenance injection for streaming path
         provenance = []
-        for p in partials:
-            if isinstance(p, dict):
-                provenance.append({
-                    "type": "internal", "source": "pdf", "page": p.get("page"),
-                    "tool": None, "category": None, "text": p.get("text", "")[:500],
-                    "similarity": p.get("similarity"),
-                })
-        for s in external_provenance:
+        abs_pdf = os.path.abspath(pdf_path)
+        for f in internal_facts:
             provenance.append({
-                "type": "external", "source": s.get("url", ""), "page": None,
-                "tool": s.get("tool"), "category": s.get("category"),
-                "text": s.get("text", "")[:500], "similarity": None,
+                "type": "internal",
+                "source": abs_pdf,
+                "page": f.get("page"),
+                "tool": None,
+                "category": None,
+                "text": (f.get("text", "") or "")[:500],
+                "similarity": f.get("similarity"),
             })
-        for p in provenance:
-            p.setdefault("type", "internal")
-            p.setdefault("source", "pdf")
-            p.setdefault("page", None)
-            p.setdefault("tool", None)
-            p.setdefault("category", None)
-            p.setdefault("text", "")
-            p.setdefault("similarity", None)
+        for f in external_facts:
+            provenance.append({
+                "type": "external",
+                "source": f.get("url", ""),
+                "page": None,
+                "tool": f.get("tool"),
+                "category": f.get("category"),
+                "text": (f.get("text", "") or "")[:500],
+                "similarity": None,
+            })
         synth_done = True
         final_answer = answer_acc.strip() or "Insufficient evidence. No relevant internal or external sources found."
         _append_trace(trace, "synthesizer", "ok", time.time() - t_synth)
@@ -653,13 +761,12 @@ def run_workflow_stream(
         confidence = 0.0
         provenance = []
         verifier_flags = []
-    finally:
-        yield {
-            "type": "final",
-            "answer": final_answer,
-            "confidence": confidence,
-            "provenance": provenance,
-            "flags": verifier_flags,
-            "trace": trace,
-            "tool_calls": tool_calls,
-        }
+    yield {
+        "type": "final",
+        "answer": final_answer,
+        "confidence": confidence,
+        "provenance": provenance,
+        "flags": verifier_flags,
+        "trace": trace,
+        "tool_calls": tool_calls,
+    }

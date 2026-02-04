@@ -497,11 +497,14 @@ def main():
             src = p.get("source", "pdf")
             page = p.get("page")
             tool = p.get("tool")
-            line = f"  [{typ}] {src}"
-            if page is not None:
-                line += f" page={page}"
-            if typ == "external" and tool:
-                line += f" tool={tool}"
+            if typ == "internal":
+                line = f"  internal | {src}"
+                if page is not None:
+                    line += f" | page={page}"
+            else:
+                line = f"  external | {src}"
+                if tool:
+                    line += f" | tool={tool}"
             print(line)
         print("\n=== CONFIDENCE ===\n")
         print(result.get("confidence", 0.0))
