@@ -29,6 +29,51 @@ def _ts():
     return datetime.utcnow().isoformat() + "Z"
 
 
+_COMPARISON_TERMS = ("compare", "comparison", "versus", "vs", " vs ", " and ")
+_SLOT_KEYWORDS = {
+    "market capitalization": ["market cap", "market capitalization"],
+    "revenue": ["revenue", "total revenue"],
+    "net income": ["net income", "profit"],
+}
+
+
+def extract_missing_slots(query: str, internal_facts: list) -> list[str]:
+    """
+    Extract key fields from query and return which are not found in internal_facts.
+    Simple keyword-based heuristic for BFSI metrics.
+    """
+    q = (query or "").lower()
+    facts_text = " ".join((f.get("text", "") or "") for f in internal_facts).lower()
+    missing = []
+    for slot, phrases in _SLOT_KEYWORDS.items():
+        if any(p in q for p in phrases):
+            if not any(p in facts_text for p in phrases):
+                missing.append(slot)
+    return missing
+
+
+def is_answer_incomplete(query: str, internal_facts: list, answer_text: str) -> tuple[bool, list[str]]:
+    """
+    Returns (True, missing_slots) if key entities or attributes in query are
+    not covered by internal_facts/answer_text.
+    Heuristics:
+      - if comparison language and multiple slots requested and some missing
+      - otherwise, any requested slot missing.
+    """
+    q = (query or "").lower()
+    missing = extract_missing_slots(query, internal_facts)
+    if not missing:
+        return False, []
+    requested_slots = [
+        slot for slot, phrases in _SLOT_KEYWORDS.items()
+        if any(p in q for p in phrases)
+    ]
+    has_comparison = any(t in q for t in _COMPARISON_TERMS)
+    if has_comparison and len(requested_slots) > 1:
+        return True, missing
+    return True, missing
+
+
 def _call_llm():
     from local_pdf_qa import call_bedrock, call_bedrock_stream
     return call_bedrock, call_bedrock_stream
@@ -426,7 +471,35 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
             "timestamp": m.get("timestamp"),
         })
 
-    if ENABLE_RERANKER and (synth_input_partials or external_provenance):
+    # Partial external completion: if classifier says internal-only but internal facts
+    # miss key slots, fetch only missing information via external tools.
+    partial_external_completion = False
+    if ENABLE_TOOL_AGENT and not cls.get("external_needed", True) and internal_facts:
+        incomplete, missing_slots = is_answer_incomplete(query, internal_facts, "")
+        if incomplete and missing_slots:
+            try:
+                import tools
+                completion_query = (
+                    "Fetch ONLY up-to-date external data to fill the following missing "
+                    "fields for this financial research question.\n\n"
+                    f"Original question: {query}\n"
+                    f"Missing fields: {', '.join(missing_slots)}"
+                )
+                ext_text, completion_snippets = tools.run_external_search(
+                    completion_query, call_llm_fn=call_bedrock
+                )
+            except Exception:
+                completion_snippets = []
+            for s in completion_snippets:
+                external_facts.append({
+                    "text": s.get("text", ""),
+                    "url": s.get("url", ""),
+                    "tool": s.get("tool"),
+                    "category": s.get("category"),
+                })
+            partial_external_completion = bool(completion_snippets)
+
+    if ENABLE_RERANKER and (internal_facts or external_facts):
         try:
             from reranker import generate_candidate_answers, rank_candidates
             candidates = generate_candidate_answers(
@@ -492,6 +565,8 @@ def run_workflow(query: str, pdf_path: str, use_streaming: bool = True) -> dict:
     trace.append({"agent": "verifier", "confidence": ver["confidence"], "timestamp": _ts()})
 
     flags = ver.get("flags", [])
+    if partial_external_completion and internal_facts and external_facts:
+        flags.append("PARTIAL_EXTERNAL_COMPLETION")
     result = {
         "answer": synth["answer"],
         "confidence": ver["confidence"],
@@ -679,6 +754,31 @@ def run_workflow_stream(
                 "text": f"Q: {m.get('question')}\nA: {m.get('answer')}",
                 "timestamp": m.get("timestamp"),
             })
+
+        # Partial external completion in streaming path
+        if ENABLE_TOOL_AGENT and not cls.get("external_needed", True) and internal_facts:
+            incomplete, missing_slots = is_answer_incomplete(query, internal_facts, "")
+            if incomplete and missing_slots:
+                try:
+                    import tools
+                    completion_query = (
+                        "Fetch ONLY up-to-date external data to fill the following missing "
+                        "fields for this financial research question.\n\n"
+                        f"Original question: {query}\n"
+                        f"Missing fields: {', '.join(missing_slots)}"
+                    )
+                    ext_text, completion_snippets = tools.run_external_search(
+                        completion_query, call_llm_fn=_call_llm()[0]
+                    )
+                except Exception:
+                    completion_snippets = []
+                for s in completion_snippets:
+                    external_facts.append({
+                        "text": s.get("text", ""),
+                        "url": s.get("url", ""),
+                        "tool": s.get("tool"),
+                        "category": s.get("category"),
+                    })
 
         yield {"type": "log", "message": "Synthesizing answer..."}
         t_synth = time.time()

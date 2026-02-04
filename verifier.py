@@ -125,11 +125,6 @@ def verifier_agent(
             if cat == "generic" and "web_search" in str(tool).lower():
                 pass
 
-    if internal_count == 0 and external_count == 0:
-        flags.append("NO_INTERNAL_EVIDENCE")
-    elif internal_count == 0 and external_count > 0:
-        flags.append("NO_INTERNAL_EVIDENCE")
-
     if external_count > 0 and all(s <= 0.5 for s in source_scores if s < 1.0):
         flags.append("ONLY_GENERIC_WEB")
 

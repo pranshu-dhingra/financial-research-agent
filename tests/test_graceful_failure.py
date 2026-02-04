@@ -18,7 +18,8 @@ class TestGracefulFailure(unittest.TestCase):
         provenance = []
         result = verifier_agent(answer, provenance, [], [])
         self.assertLess(result["confidence"], 0.4)
-        self.assertIn("NO_INTERNAL_EVIDENCE", result["flags"])
+        # With system-enforced provenance, we no longer emit NO_INTERNAL_EVIDENCE.
+        # Instead, absence of provenance plus low confidence is sufficient.
 
     def test_verifier_insufficient_answer_lowers_confidence(self):
         """Answer containing 'insufficient' lowers verifier checks score."""
@@ -33,7 +34,7 @@ class TestGracefulFailure(unittest.TestCase):
         """Synthesizer returns insufficient evidence when no partials and no external."""
         from orchestrator import synthesizer_agent
 
-        result = synthesizer_agent([], [], None, "test?", use_streaming=False)
+        result = synthesizer_agent([], [], [], "test?", use_streaming=False)
         self.assertIn("answer", result)
         self.assertIn("insufficient", result["answer"].lower())
 

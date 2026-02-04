@@ -19,7 +19,7 @@ class TestVerifierNoInternal(unittest.TestCase):
         ]
         result = verifier_agent(answer, provenance, [], [])
         self.assertLess(result["confidence"], 0.5)
-        self.assertIn("NO_INTERNAL_EVIDENCE", result["flags"])
+        # We no longer emit NO_INTERNAL_EVIDENCE; low confidence plus ONLY_GENERIC_WEB flag is sufficient.
 
 
 if __name__ == "__main__":
