@@ -73,7 +73,18 @@ def missing_entities_detected(query, partials):
 def run_workflow(question: str, pdf_path: str, use_streaming: bool = True) -> dict:
     """
     Full workflow: internal RAG + partial external completion + verification.
-    Returns: {answer, provenance, confidence, flags}
+    
+    Args:
+        question: User query
+        pdf_path: Path to PDF file
+        use_streaming: Whether to use streaming (currently not actively used)
+    
+    Returns:
+        dict with keys:
+        - answer: Final answer string
+        - provenance: List of source items with type, source, text, similarity
+        - confidence: Confidence score 0.0-1.0
+        - flags: List of flag strings (e.g., "PARTIAL_EXTERNAL_COMPLETION")
     """
     provenance = []
     

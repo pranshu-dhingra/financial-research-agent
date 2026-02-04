@@ -9,16 +9,16 @@ import os
 import sys
 from pathlib import Path
 
+# Set environment before importing
+os.environ["ENABLE_TOOL_PLANNER"] = "1"
+os.environ["DEBUG"] = "1"
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from orchestrator import run_workflow
 
 def test_partial_external_fallback():
     """Test that partial internal evidence triggers external augmentation."""
-    
-    # Set environment
-    os.environ["ENABLE_TOOL_PLANNER"] = "1"
-    os.environ["DEBUG"] = "1"
     
     pdf_path = "uploads/BAC_2024_Annual_Report.pdf"
     question = "What is the current market capitalization of Bank of America and how does it compare to its revenue in 2024?"

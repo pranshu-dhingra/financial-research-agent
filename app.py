@@ -8,6 +8,7 @@ Research dashboard: upload PDFs, ask questions, view provenance and confidence.
 import os
 import sys
 from pathlib import Path
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -16,9 +17,11 @@ import streamlit as st
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 DEBUG = os.environ.get("DEBUG", "0") == "1"
+GLOBAL_UI_TIMEOUT = 30  # seconds
 
 
 def _ensure_imports():
+    """Import core functions from local_pdf_qa."""
     from local_pdf_qa import (
         load_memory_for_pdf,
         clear_memory_for_pdf,
@@ -37,9 +40,39 @@ def list_uploaded_pdfs():
     return sorted(set(paths), key=lambda p: p.name)
 
 
+def list_pdf_memories():
+    """List all PDFs and their memory counts."""
+    from local_pdf_qa import list_all_memory_files, load_memory_for_pdf, _pdf_memory_filename
+    
+    memory_info = {}
+    for pdf_path in list_uploaded_pdfs():
+        memory = load_memory_for_pdf(str(pdf_path))
+        count = len(memory)
+        memory_info[str(pdf_path)] = count
+    return memory_info
+
+
+def query_offline_memory(question, pdf_path):
+    """Search offline memory for similar questions."""
+    from local_pdf_qa import load_memory_for_pdf, find_relevant_memories_semantic
+    
+    memory = load_memory_for_pdf(str(pdf_path))
+    if not memory:
+        return None
+    relevant = find_relevant_memories_semantic(question, memory, top_k=1)
+    if relevant and relevant[0].get("_similarity", 0) > 0.7:
+        return relevant[0]
+    return None
+
+
 def main():
+    """Main Streamlit application."""
     st.set_page_config(page_title="BFSI Research Assistant", layout="wide")
     st.title("BFSI Research Assistant")
+
+    # Initialize session state
+    if "offline_mode" not in st.session_state:
+        st.session_state["offline_mode"] = False
 
     pdfs = list_uploaded_pdfs()
     pdf_options = [str(p) for p in pdfs]
@@ -47,7 +80,17 @@ def main():
         pdf_options = ["(No PDFs available)"]
 
     with st.sidebar:
-        st.header("Document Manager")
+        st.header("📚 Document Manager")
+        
+        # Available PDFs and Memory counts
+        st.subheader("Available PDFs")
+        memory_info = list_pdf_memories()
+        for pdf_path, count in memory_info.items():
+            st.caption(f"📄 {Path(pdf_path).name}: {count} Q&As")
+        
+        st.divider()
+        
+        # Upload new PDF
         uploaded = st.file_uploader("Upload PDF", type=["pdf"])
         if uploaded:
             dest = UPLOAD_DIR / uploaded.name
@@ -61,13 +104,34 @@ def main():
             st.success(f"Uploaded: {uploaded.name}")
             st.rerun()
 
+        st.divider()
+
+        # Select PDF
         selected = st.selectbox("Select PDF", pdf_options)
+        
+        # Offline/Online mode toggle
+        st.subheader("⚙️ Mode")
+        st.session_state["offline_mode"] = st.checkbox(
+            "Offline mode (memory only, no LLM/API calls)",
+            value=st.session_state["offline_mode"]
+        )
+        
+        if st.session_state["offline_mode"]:
+            st.info("💡 Offline: Instant results from memory. No external API calls.")
+        else:
+            st.info("🌐 Online: Live LLM analysis with SerpAPI augmentation.")
+
+        st.divider()
+
+        # Memory management
         if selected and selected != "(No PDFs available)":
-            if st.button("Show Memory for Selected PDF"):
+            st.subheader("Memory Tools")
+            if st.button("📖 View Full Memory"):
                 st.session_state["show_memory"] = selected
-            if st.button("Clear Memory for Selected PDF"):
+            if st.button("🗑️ Clear Memory"):
                 st.session_state["confirm_clear"] = selected
 
+    # Clear memory confirmation
     if st.session_state.get("confirm_clear"):
         pdf_path = st.session_state["confirm_clear"]
         st.sidebar.warning(f"Clear memory for {os.path.basename(pdf_path)}?")
@@ -85,105 +149,109 @@ def main():
             st.session_state.pop("confirm_clear", None)
             st.rerun()
 
-    question = st.text_input("Question", placeholder="Enter research question...")
-    live_mode = st.checkbox("Run live analysis (may incur model cost)", value=True)
-    ask_clicked = st.button("Ask")
+    # Main query interface
+    st.subheader("🔍 Query")
+    question = st.text_input("Your question...", placeholder="Enter research question...")
+    ask_clicked = st.button("Ask", type="primary")
 
     if ask_clicked and question and selected and selected != "(No PDFs available)":
         pdf_path = selected
-        if live_mode:
-            placeholder = st.empty()
-            logbox = st.empty()
-            answer_text = ""
-            result = None
-            try:
-                from orchestrator import run_workflow_stream, safe_stream
-                for event in safe_stream(run_workflow_stream(question, pdf_path, max_chunks=5, timeout_sec=90)):
-                    if event.get("type") == "log":
-                        logbox.markdown("**" + event.get("message", "") + "**")
-                    elif event.get("type") == "token":
-                        answer_text += event.get("text", "")
-                        placeholder.markdown(answer_text or "_Thinking..._")
-                    elif event.get("type") == "final":
-                        result = event
-                        break
-                    elif event.get("type") == "error":
-                        st.error(event.get("message", "Unknown error"))
-                        break
-            except Exception as e:
-                st.error(f"Error: {e}")
-            if result:
-                logbox.empty()
-                placeholder.empty()
-                st.subheader("Answer")
-                st.write(result.get("answer", ""))
-                st.subheader("Sources")
-                prov = result.get("provenance", [])
-                if prov:
-                    rows = []
-                    for p in prov:
-                        rows.append({
-                            "type": p.get("type", ""),
-                            "source": p.get("source", ""),
-                            "category": p.get("category", ""),
-                            "snippet": (p.get("text", "") or "")[:200] + ("..." if len(p.get("text", "") or "") > 200 else ""),
-                        })
-                    st.dataframe(rows, width="stretch")
-                else:
-                    st.write("No sources.")
-                st.subheader("Confidence")
-                conf = result.get("confidence", 0.0)
-                if conf > 0.8:
-                    label = "High"
-                elif conf >= 0.5:
-                    label = "Medium"
-                else:
-                    label = "Low"
-                st.write(f"{conf:.2f} ({label})")
-                if result.get("flags"):
-                    st.caption(f"Flags: {', '.join(result.get('flags', []))}")
-        else:
-            load_memory_for_pdf, _, _ = _ensure_imports()
-            memory = load_memory_for_pdf(pdf_path)
-            if not memory:
-                st.info("No stored Q&As for this PDF. Run live analysis to build memory.")
-            else:
-                st.subheader("Stored Q&As (Offline)")
-                n = min(10, len(memory))
-                for i, m in enumerate(reversed(memory[-n:])):
-                    with st.expander(f"Q: {m.get('question', '')[:60]}..."):
-                        st.write("**Answer:**", m.get("answer", ""))
-                        st.caption(f"Confidence: {m.get('confidence', 0):.2f} | {m.get('timestamp', '')}")
-                        if m.get("provenance"):
-                            st.write("**Provenance:**")
-                            for p in m["provenance"]:
-                                st.write(f"- [{p.get('type')}] {p.get('source', '')[:80]}")
 
+        if st.session_state["offline_mode"]:
+            # Offline mode: search memory instantly
+            st.subheader("Answer (from Memory)")
+            result = query_offline_memory(question, pdf_path)
+            if result:
+                st.write(result.get("answer", ""))
+                st.caption(f"✓ From memory | Confidence: {result.get('confidence', 0):.2f}")
+            else:
+                st.info("Not found in memory. No LLM calls in offline mode.")
+        else:
+            # Online mode: use orchestrator with streaming
+            with st.spinner("Analyzing..."):
+                try:
+                    from orchestrator import run_workflow
+                    start_time = time.time()
+                    result = run_workflow(question, pdf_path, use_streaming=False)
+                    elapsed = time.time() - start_time
+                    
+                    if elapsed > GLOBAL_UI_TIMEOUT:
+                        st.warning(f"⏱️ Query took {elapsed:.0f}s (timeout: {GLOBAL_UI_TIMEOUT}s)")
+                    
+                    if result and result.get("answer"):
+                        st.subheader("Answer")
+                        st.write(result["answer"])
+                        
+                        st.subheader("Sources")
+                        prov = result.get("provenance", [])
+                        if prov:
+                            rows = []
+                            for p in prov:
+                                rows.append({
+                                    "Type": p.get("type", "").upper(),
+                                    "Source": os.path.basename(p.get("source", ""))[:40],
+                                    "Snippet": (p.get("text", "") or "")[:100] + "...",
+                                })
+                            st.dataframe(rows, use_container_width='stretch')
+                        else:
+                            st.write("No sources.")
+                        
+                        st.subheader("Confidence")
+                        conf = result.get("confidence", 0.0)
+                        if conf > 0.8:
+                            label = "🟢 High"
+                        elif conf >= 0.5:
+                            label = "🟡 Medium"
+                        else:
+                            label = "🔴 Low"
+                        st.write(f"**{conf:.2f}** ({label})")
+                        
+                        if result.get("flags"):
+                            st.caption(f"Flags: {', '.join(result.get('flags', []))}")
+                    else:
+                        st.error("No answer generated.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+                    if DEBUG:
+                        import traceback
+                        st.error(traceback.format_exc())
+
+    # Memory viewer
     if st.session_state.get("show_memory"):
         pdf_path = st.session_state["show_memory"]
-        st.subheader(f"Memory: {os.path.basename(pdf_path)}")
+        st.subheader(f"📖 Memory: {os.path.basename(pdf_path)}")
         load_memory_for_pdf, _, _ = _ensure_imports()
         memory = load_memory_for_pdf(pdf_path)
+        
         if not memory:
             st.write("No stored Q&As.")
         else:
+            st.write(f"**Total Q&As: {len(memory)}**")
+            st.divider()
+            
+            # Memory preview
             rows = []
             for m in memory:
                 rows.append({
-                    "question": m.get("question", "")[:80],
-                    "answer": m.get("answer", "")[:80],
-                    "confidence": m.get("confidence", 0),
-                    "timestamp": m.get("timestamp", ""),
+                    "Q": m.get("question", "")[:60],
+                    "Confidence": f"{m.get('confidence', 0):.2f}",
+                    "Time": m.get("timestamp", "")[:10],
                 })
-            st.dataframe(rows, width="stretch")
-            for m in memory:
+            st.dataframe(rows, use_container_width='stretch')
+            
+            st.divider()
+            
+            # Expandable details
+            for i, m in enumerate(memory):
                 with st.expander(f"Q: {m.get('question', '')[:60]}..."):
-                    st.write("**Answer:**", m.get("answer", ""))
+                    st.write("**Answer:**")
+                    st.write(m.get("answer", ""))
                     st.caption(f"Confidence: {m.get('confidence', 0):.2f} | {m.get('timestamp', '')}")
                     if m.get("provenance"):
-                        st.write("**Provenance:**")
+                        st.write("**Sources:**")
                         for p in m["provenance"]:
-                            st.write(f"- [{p.get('type')}] {p.get('source', '')[:80]}")
+                            st.write(f"- {p.get('type', '').upper()}: {p.get('source', '')}")
+        
         if st.button("Close Memory View"):
             st.session_state.pop("show_memory", None)
             st.rerun()

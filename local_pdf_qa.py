@@ -472,6 +472,105 @@ def make_synthesis_prompt(partials, question, prior_memory_text=None, external_c
     )
 
 
+def make_partial_completion_synthesis_prompt(internal_facts, external_facts, question, prior_memory_text=None):
+    """
+    Prompt for merging internal facts with external completion facts.
+    """
+    int_facts = "\n".join(internal_facts) if internal_facts else ""
+    ext_facts = "\n".join(external_facts) if external_facts else ""
+    mem = f"PAST INTERACTIONS:\n{prior_memory_text}\n\n" if prior_memory_text else ""
+    return (
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n"
+        "You are a senior researcher completing a partial answer using internal and external facts.\n\n"
+        f"{mem}INTERNAL FACTS:\n{int_facts}\n\nEXTERNAL FACTS (COMPLETION):\n{ext_facts}\n\n"
+        "INSTRUCTIONS:\n"
+        "- Complete the answer using internal facts first.\n"
+        "- Use external facts only for missing fields.\n"
+        "- Do NOT hallucinate.\n"
+        "- Merge into one clear, complete answer.\n\n"
+        f"FINAL QUESTION:\n{question}\n\nFINAL ANSWER:\n"
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+    )
+
+
+def is_answer_incomplete(query, internal_facts, answer_text):
+    """
+    Returns True if key entities or attributes in query
+    are not covered by internal_facts.
+    """
+    import re
+    
+    print(f"[DEBUG] is_answer_incomplete called with query: {query[:50]}..., answer: {answer_text[:50]}...")
+    
+    query_lower = query.lower()
+    answer_lower = answer_text.lower()
+    
+    # Heuristics for incompleteness
+    comparison_keywords = ["compare", "versus", "vs", "and", "both", "difference", "how does"]
+    if any(kw in query_lower for kw in comparison_keywords):
+        # Check if query has multiple entities
+        # Simple: if "and" or "vs" and answer doesn't mention both parts
+        entities = re.findall(r'\b[A-Z][a-z]+\b|\b\d+\b', query)  # Proper nouns or numbers
+        if len(entities) > 1:
+            # Check if answer covers all entities
+            covered = sum(1 for e in entities if e.lower() in answer_lower)
+            if covered < len(entities) * 0.5:  # Less than half covered
+                return True
+    
+    # Check for important terms missing
+    important_terms = ["market cap", "revenue", "profit", "assets", "liabilities", "price", "value"]
+    query_terms = [t for t in important_terms if t in query_lower]
+    if query_terms:
+        # If answer indicates information not found for key terms
+        if "not found" in answer_lower and any(t in answer_lower for t in query_terms):
+            print(f"[DEBUG] is_answer_incomplete: answer indicates missing info for {query_terms}")
+            return True
+        missing = [t for t in query_terms if t not in answer_lower]
+        if missing:
+            print(f"[DEBUG] is_answer_incomplete: missing important terms {missing}")
+            return True
+    
+    return False
+
+
+def extract_missing_slots(query, internal_facts):
+    """
+    Extract key fields from query and return which are not found in internal_facts.
+    Example: query: market cap vs revenue, internal_facts: revenue only → missing: ["market capitalization"]
+    """
+    import re
+    
+    query_lower = query.lower()
+    facts_text = "\n".join(internal_facts).lower() if internal_facts else ""
+    
+    # Common financial terms
+    financial_terms = {
+        "market cap": ["market capitalization", "market cap", "market value"],
+        "revenue": ["revenue", "sales", "income"],
+        "profit": ["profit", "earnings", "net income"],
+        "assets": ["assets", "total assets"],
+        "liabilities": ["liabilities"],
+        "price": ["price", "stock price", "share price"],
+        "cap": ["capital", "capitalization"],
+        "rate": ["rate", "interest rate"],
+        "ratio": ["ratio", "ratios"],
+    }
+    
+    missing = []
+    for term, synonyms in financial_terms.items():
+        if term in query_lower:
+            if not any(syn in facts_text for syn in synonyms):
+                missing.append(term)
+    
+    # Extract named entities (companies, etc.)
+    entities = re.findall(r'\b[A-Z][a-z]+\b', query)
+    for entity in entities:
+        if entity.lower() not in facts_text:
+            missing.append(entity)
+    
+    return missing
+
+
 # --- Main ---
 
 def main():
@@ -524,6 +623,7 @@ def main():
         print(f"Found {len(relevant)} relevant past interaction(s).")
     prior_mem_text = "\n".join(f"Q: {m.get('question')}\nA: {m.get('answer')}" for m in relevant) if relevant else None
 
+    # Initial external check (may be skipped if internal is sufficient)
     external_context = None
     external_provenance = []
     if ENABLE_TOOL_PLANNER:
@@ -581,12 +681,62 @@ def main():
             else:
                 final_answer = "Not found in document"
         else:
-            print("Synthesizing final answer...")
-            final_answer = call_bedrock_stream(
-                make_synthesis_prompt(partials, question, prior_mem_text, external_context, external_provenance)
+            # First, synthesize internal answer only
+            print("Synthesizing internal answer...")
+            internal_answer = call_bedrock_stream(
+                make_synthesis_prompt(partials, question, prior_mem_text, external_context=None, external_provenance=None)
             )
-            if not (final_answer or final_answer.strip()):
-                final_answer = "Not found in document"
+            if not (internal_answer or internal_answer.strip()):
+                internal_answer = "Not found in document"
+            
+            # Check if answer is incomplete
+            is_incomplete = is_answer_incomplete(question, partials, internal_answer)
+            
+            if is_incomplete and ENABLE_TOOL_PLANNER:
+                print("Internal answer appears incomplete, checking for missing information...")
+                missing_slots = extract_missing_slots(question, partials)
+                if missing_slots:
+                    print(f"Missing slots detected: {missing_slots}")
+                    try:
+                        import tools
+                        # Call tool_planner with missing slots as query
+                        missing_query = ", ".join(missing_slots)
+                        plan = tools.tool_planner_agent({"query": missing_query, "context": question}, call_llm_fn=call_bedrock)
+                        providers = plan.get("recommended_providers", [])
+                        if providers:
+                            print("Fetching external completion data...")
+                            completion_context, completion_provenance = tools.run_external_search(
+                                missing_query, call_llm_fn=call_bedrock
+                            )
+                            if completion_context and completion_context.strip():
+                                print("External completion data retrieved.")
+                                # Merge internal and external
+                                final_answer = call_bedrock_stream(
+                                    make_partial_completion_synthesis_prompt(
+                                        partials, [completion_context], question, prior_mem_text
+                                    )
+                                )
+                                # Update provenance
+                                external_provenance.extend(completion_provenance)
+                                external_context = (external_context or "") + "\n\n" + completion_context
+                            else:
+                                final_answer = internal_answer
+                        else:
+                            final_answer = internal_answer
+                    except Exception as e:
+                        if DEBUG:
+                            print(f"[DEBUG] partial external completion failed: {e}")
+                        final_answer = internal_answer
+                else:
+                    final_answer = internal_answer
+            else:
+                # Use existing logic if not incomplete or tool planner disabled
+                print("Synthesizing final answer...")
+                final_answer = call_bedrock_stream(
+                    make_synthesis_prompt(partials, question, prior_mem_text, external_context, external_provenance)
+                )
+                if not (final_answer or final_answer.strip()):
+                    final_answer = "Not found in document"
 
     print("\n=== FINAL ANSWER ===\n")
     print(final_answer)
