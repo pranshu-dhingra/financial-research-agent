@@ -35,6 +35,67 @@ Query
 Answer + Provenance + Confidence + Flags
 ```
 
+## Project Structure
+
+The codebase is organized into five modular layers:
+
+```
+pdf-qa-agent/
+├── config/                    # Configuration & environment variables
+│   ├── settings.py           # All 30+ config constants
+│   └── __init__.py
+│
+├── core/                      # Core utilities (no business logic)
+│   ├── embeddings.py         # AWS Bedrock embedding generation
+│   ├── pdf_loader.py         # PDF text extraction (PyPDF2)
+│   ├── chunking.py           # Text sliding-window chunking
+│   └── __init__.py
+│
+├── agent/                     # Business logic & orchestration
+│   ├── orchestrator.py       # Main RAG workflow (semantic → synthesis → verify)
+│   ├── synthesizer.py        # LLM calls + prompt templates
+│   ├── retriever.py          # Chunk & memory semantic search
+│   ├── memory.py             # Per-PDF semantic memory (JSON)
+│   ├── verifier.py           # Confidence scoring & contradiction detection
+│   ├── tools.py              # External search (SerpAPI) integration
+│   └── __init__.py
+│
+├── ui/                        # Web interface
+│   ├── streamlit_app.py      # Streamlit dashboard
+│   └── __init__.py
+│
+├── cli/                       # Command-line interface
+│   ├── local_pdf_qa.py       # CLI entrypoint
+│   └── __init__.py
+│
+├── tests/                     # Test suite
+├── memories/                  # Per-PDF semantic memory files
+├── uploads/                   # User-uploaded PDFs
+└── requirements.txt           # Python dependencies
+```
+
+### Layer Responsibilities
+
+- **config/**: Environment variables, feature flags, constants
+- **core/**: Stateless utilities for PDFs, embeddings, chunking (reusable in any context)
+- **agent/**: Stateful business logic (retrieval, synthesis, orchestration, memory)
+- **ui/**: Streamlit web dashboard (interactive queries)
+- **cli/**: Command-line interface (batch/programmatic queries)
+
+### Running the Application
+
+**CLI (command-line):**
+```bash
+python cli/local_pdf_qa.py path/to/document.pdf "Your question"
+```
+
+**Web UI (Streamlit):**
+```bash
+streamlit run ui/streamlit_app.py
+```
+
+Then upload PDFs and ask questions interactively.
+
 ## How External Search is Triggered
 
 External search (SerpAPI) is **automatically invoked** when:
