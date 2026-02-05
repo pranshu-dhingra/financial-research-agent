@@ -234,7 +234,6 @@ def main():
             for m in memory:
                 rows.append({
                     "Q": m.get("question", "")[:60],
-                    "Confidence": f"{m.get('confidence', 0):.2f}",
                     "Time": m.get("timestamp", "")[:10],
                 })
             st.dataframe(rows, use_container_width='stretch')
@@ -246,7 +245,7 @@ def main():
                 with st.expander(f"Q: {m.get('question', '')[:60]}..."):
                     st.write("**Answer:**")
                     st.write(m.get("answer", ""))
-                    st.caption(f"Confidence: {m.get('confidence', 0):.2f} | {m.get('timestamp', '')}")
+                    st.caption(f"{m.get('timestamp', '')}")
                     if m.get("provenance"):
                         st.write("**Sources:**")
                         for p in m["provenance"]:
