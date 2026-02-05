@@ -183,12 +183,14 @@ def run_workflow(question: str, pdf_path: str, use_streaming: bool = True) -> di
     # Check for incompleteness
     internal_partial = is_internal_partial(partials, internal_answer, provenance)
     missing_entities = missing_entities_detected(question, partials)
-    print(f"[DEBUG] internal_partial: {internal_partial}, missing_entities: {missing_entities}, ENABLE_TOOL_PLANNER: {ENABLE_TOOL_PLANNER}")
+    internal_sufficient = not (internal_partial or missing_entities)
+    print(f"[DEBUG] internal_partial: {internal_partial}, missing_entities: {missing_entities}, internal_sufficient: {internal_sufficient}, ENABLE_TOOL_PLANNER: {ENABLE_TOOL_PLANNER}")
     
     external_context = None
     external_provenance = []
     
     if (internal_partial or missing_entities) and os.environ.get("ENABLE_TOOL_PLANNER", "0") == "1":
+        print(f"[DEBUG] External lookup triggered: internal_sufficient=False")
         try:
             import tools
             print(f"[DEBUG] Calling SerpAPI for original query: {question}")
@@ -217,6 +219,9 @@ def run_workflow(question: str, pdf_path: str, use_streaming: bool = True) -> di
             print(f"[DEBUG] external augmentation failed: {e}")
             import traceback
             traceback.print_exc()
+    else:
+        if internal_sufficient:
+            print(f"[DEBUG] External lookup skipped: internal_sufficient=True")
     
     # Verify and get confidence
     flags = []
