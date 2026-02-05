@@ -1,28 +1,60 @@
-# Credentials (secrets)
-.tool_credentials.json
-
-# Uploads (user data)
-uploads/
-
-# Memory (per-PDF Q&A history)
-memories/
-
-# Evaluation artifacts (generated)
-evaluation_results.json
-evaluation_results.md
-
-# Python
+# ============================================================
+# PYTHON
+# ============================================================
 __pycache__/
 *.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
 .venv/
 venv/
+env/
+ENV/
 
-# IDE
+# ============================================================
+# IDE & EDITOR
+# ============================================================
 .idea/
 .vscode/
-# Test artifacts
-test_confidence_minimal.py
-
-# OS
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
+
+# ============================================================
+# CREDENTIALS & SECRETS (CRITICAL)
+# ============================================================
+.tool_credentials.json
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# ============================================================
+# USER DATA (NOT FOR PUBLIC DISTRIBUTION)
+# ============================================================
+uploads/
+memories/
+embeddings/
+
+# ============================================================
+# TEST & EVALUATION ARTIFACTS
+# ============================================================
+test_*.py
+evaluation_results.json
+evaluation_results.md
+.pytest_cache/
+.coverage
+htmlcov/
+pytest-results.xml
+
+# ============================================================
+# PROJECT-SPECIFIC GENERATED FILES
+# ============================================================
+*.log
+*.tmp
+.cursor/

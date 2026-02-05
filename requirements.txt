@@ -1,4 +1,4 @@
-# Core dependencies
+# Core dependencies - AWS Bedrock, PDF processing, embedding
 boto3>=1.26.0
 PyPDF2>=3.0.0
 annoy>=1.17.0
@@ -11,3 +11,7 @@ beautifulsoup4>=4.11.0
 
 # Development and testing (optional)
 pytest>=7.0.0
+
+# Note: AWS Bedrock credentials required
+# Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION
+# Or use AWS CLI: aws configure
