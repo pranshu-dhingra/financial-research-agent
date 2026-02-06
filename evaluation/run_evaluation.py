@@ -12,15 +12,15 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from evaluation_queries import EVAL_QUERIES
-from evaluation_report import generate_report
+from evaluation.evaluation_queries import EVAL_QUERIES
+from evaluation.evaluation_report import generate_report
 
 
 def resolve_pdf_path(pdf_name: str) -> str | None:
     """Resolve PDF name to full path. Searches project root and uploads/."""
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
     candidates = list(root.glob("*.pdf")) + list((root / "uploads").glob("*.pdf"))
     for p in candidates:
         if p.name == pdf_name:
