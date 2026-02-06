@@ -34,7 +34,7 @@ def run_single_query(query_spec: dict, timeout_sec: int = 30) -> dict:
     Consumes stream via safe_stream; asserts final event exists.
     Never waits indefinitely.
     """
-    from orchestrator import run_workflow_stream, safe_stream
+    from agent.orchestrator import run_workflow_stream, safe_stream
 
     pdf_name = query_spec.get("pdf", "")
     question = query_spec.get("question", "")

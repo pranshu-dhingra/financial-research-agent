@@ -18,12 +18,6 @@ How to validate correctness of the system.
 - **What**: Confidence scoring, external-only low confidence, numeric contradiction detection.
 - **Run**: `python -m pytest tests/test_verifier_*.py -v`
 
-### Reranker
-
-- **File**: `tests/test_reranker_selection.py`
-- **What**: Candidate generation, ranking logic.
-- **Run**: `python -m pytest tests/test_reranker_selection.py -v`
-
 ### Orchestrator
 
 - **File**: `tests/test_orchestrator_flow.py`

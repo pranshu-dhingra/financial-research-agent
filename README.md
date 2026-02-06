@@ -271,12 +271,26 @@ export ENABLE_TOOL_PLANNER=1    # Enable SerpAPI augmentation
 
 ```
 pdf-qa-agent/
-├── local_pdf_qa.py          # Main CLI interface
-├── orchestrator.py          # RAG workflow coordinator
-├── verifier.py              # Confidence scoring & validation
-├── tools.py                 # External search integration (SerpAPI)
-├── reranker.py              # Optional reranking for retrieval
-├── app.py                   # Streamlit UI
+├── agent/                   # Business logic & orchestration
+│   ├── orchestrator.py      # RAG workflow coordinator
+│   ├── verifier.py          # Confidence scoring & validation
+│   ├── tools.py             # External search integration (SerpAPI)
+│   ├── memory.py            # Per-PDF semantic memory
+│   ├── retriever.py         # Chunk & memory semantic search
+│   └── synthesizer.py       # LLM calls + prompt templates
+├── cli/                     # Command-line utilities
+│   ├── local_pdf_qa.py      # Main Q&A CLI
+│   └── manage_tools.py      # Tool provider management
+├── ui/                      # Web interface
+│   └── streamlit_app.py     # Streamlit web UI
+├── evaluation/              # Evaluation suite
+│   ├── run_evaluation.py    # Evaluation harness
+│   ├── evaluation_queries.py # Test queries
+│   └── evaluation_report.py # Report generation
+├── core/                    # Core utilities (no business logic)
+│   ├── embeddings.py        # AWS Bedrock embeddings
+│   ├── pdf_loader.py        # PDF text extraction
+│   └── chunking.py          # Text sliding-window chunking
 ├── requirements.txt         # Dependencies
 ├── tool_config.json         # Provider templates (no secrets)
 ├── memories/                # Auto-generated Q&A storage (ignored)

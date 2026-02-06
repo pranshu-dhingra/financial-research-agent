@@ -63,8 +63,9 @@ TOOL_KNOWLEDGE_BASE = {
     },
 }
 
-TOOL_CONFIG_PATH = Path(__file__).parent / "tool_config.json"
-CREDENTIALS_STORE_PATH = Path(__file__).parent / ".tool_credentials.json"
+TOOL_CONFIG_PATH = Path(__file__).resolve().parent.parent / "tool_config.json"
+# Look for credentials in root directory (where user stores them)
+CREDENTIALS_STORE_PATH = Path(__file__).resolve().parent.parent / ".tool_credentials.json"
 
 # In-memory credential cache (provider_id -> dict of credentials)
 _credentials_cache = {}

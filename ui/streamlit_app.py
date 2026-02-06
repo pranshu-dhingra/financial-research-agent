@@ -238,7 +238,7 @@ def main():
             rows = []
             for m in memory:
                 rows.append({
-                    "Q": m.get("question", "")[:60],
+                    "Q": m.get("question", ""),
                     "Time": m.get("timestamp", "")[:10],
                 })
             st.dataframe(rows, use_container_width='stretch')
@@ -247,7 +247,7 @@ def main():
             
             # Expandable details
             for i, m in enumerate(memory):
-                with st.expander(f"Q: {m.get('question', '')[:60]}..."):
+                with st.expander(f"Q: {m.get('question', '')}"):
                     st.write("**Answer:**")
                     st.write(m.get("answer", ""))
                     st.caption(f"{m.get('timestamp', '')}")

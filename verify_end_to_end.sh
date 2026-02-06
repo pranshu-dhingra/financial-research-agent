@@ -26,10 +26,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path('.').resolve()))
 from unittest.mock import patch
-from orchestrator import classifier_agent
-with patch('local_pdf_qa.extract_text_from_pdf', return_value='sample'):
-    with patch('local_pdf_qa.chunk_text', return_value=['chunk1']):
-        with patch('local_pdf_qa.find_relevant_chunks_token', return_value=[
+from agent.orchestrator import classifier_agent
+with patch('core.extract_text_from_pdf', return_value='sample'):
+    with patch('core.chunk_text', return_value=['chunk1']):
+        with patch('agent.retriever.find_relevant_chunks_token', return_value=[
             {'chunk_text': 'c', 'idx': 0, 'similarity': 0.9}
         ]):
             r = classifier_agent('test query', 'dummy.pdf')
@@ -42,12 +42,12 @@ echo ""
 echo "[3/3] Manual verification steps:"
 echo ""
 echo "  1. Register provider (optional):"
-echo "     python manage_tools.py list"
-echo "     python manage_tools.py add-provider --id serpapi --category generic \\"
+echo "     python cli/manage_tools.py list"
+echo "     python cli/manage_tools.py add-provider --id serpapi --category generic \\"
 echo "       --endpoint 'https://api.serpapi.com/search?q={q}&api_key={api_key}' --required api_key"
 echo ""
 echo "  2. Add credentials (optional):"
-echo "     python manage_tools.py add-credentials --provider serpapi --field api_key=YOUR_KEY"
+echo "     python cli/manage_tools.py add-credentials --provider serpapi --field api_key=YOUR_KEY"
 echo ""
 echo "  3. Run Streamlit UI:"
 echo "     streamlit run app.py"

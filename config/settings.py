@@ -19,8 +19,8 @@ EMBEDDING_MODEL_ID = os.environ.get("EMBEDDING_MODEL_ID", "amazon.titan-embed-te
 # ============================================================
 CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", 1200))
 CHUNK_OVERLAP = int(os.environ.get("CHUNK_OVERLAP", 200))
-MAX_PAGES = int(os.environ.get("MAX_PAGES", 20))
-MAX_CHUNKS = int(os.environ.get("MAX_CHUNKS", 60))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", 10))
+MAX_CHUNKS = int(os.environ.get("MAX_CHUNKS", 30))
 
 # ============================================================
 # LLM Generation Limits

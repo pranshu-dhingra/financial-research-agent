@@ -82,13 +82,13 @@ pip install -r requirements_add.txt   # optional: pytest for tests
 ### List Providers
 
 ```bash
-python manage_tools.py list
+python cli/manage_tools.py list
 ```
 
 ### Add Provider
 
 ```bash
-python manage_tools.py add-provider \
+python cli/manage_tools.py add-provider \
   --id serpapi \
   --category generic \
   --endpoint "https://api.serpapi.com/search?q={q}&api_key={api_key}" \
@@ -98,13 +98,13 @@ python manage_tools.py add-provider \
 ### Add Credentials
 
 ```bash
-python manage_tools.py add-credentials --provider serpapi --field api_key=YOUR_KEY
+python cli/manage_tools.py add-credentials --provider serpapi --field api_key=YOUR_KEY
 ```
 
 Or multiple fields:
 
 ```bash
-python manage_tools.py add-credentials --provider my_provider \
+python cli/manage_tools.py add-credentials --provider my_provider \
   --field api_key=xxx --field api_secret=yyy
 ```
 
