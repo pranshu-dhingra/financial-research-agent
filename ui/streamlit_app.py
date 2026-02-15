@@ -168,7 +168,26 @@ def main():
             result = query_offline_memory(question, pdf_path)
             if result:
                 st.write(result.get("answer", ""))
-                st.caption(f"✓ From memory | Confidence: {result.get('confidence', 0):.2f}")
+
+                # Display confidence with color-coded label
+                conf = result.get("confidence", 0.0)
+                if conf > 0.8:
+                    conf_label = "🟢 High"
+                elif conf >= 0.5:
+                    conf_label = "🟡 Medium"
+                else:
+                    conf_label = "🔴 Low"
+
+                timestamp = result.get("timestamp", "")
+                timestamp_str = timestamp[:10] if timestamp else "Unknown"
+
+                # Display confidence, timestamp, and flags
+                flags = result.get("flags", [])
+                caption_parts = [f"✓ From memory | Confidence: **{conf:.2f}** ({conf_label})", f"Answered: {timestamp_str}"]
+                if flags and len(flags) > 0:
+                    flags_str = ", ".join(flags)
+                    caption_parts.append(f"⚠️ Flags: {flags_str}")
+                st.caption(" | ".join(caption_parts))
             else:
                 st.info("Not found in memory. No LLM calls in offline mode.")
         else:
@@ -209,10 +228,13 @@ def main():
                             label = "🟡 Medium"
                         else:
                             label = "🔴 Low"
-                        st.write(f"**{conf:.2f}** ({label})")
-                        
-                        if result.get("flags"):
-                            st.caption(f"Flags: {', '.join(result.get('flags', []))}")
+                        flags = result.get("flags", [])
+                        if flags and len(flags) > 0:
+                            flags_str = ", ".join(flags)
+                            st.write(f"**{conf:.2f}** ({label})")
+                            st.caption(f"⚠️ Flags: {flags_str}")
+                        else:
+                            st.write(f"**{conf:.2f}** ({label})")
                     else:
                         st.error("No answer generated.")
                 except Exception as e:
@@ -234,12 +256,21 @@ def main():
             st.write(f"**Total Q&As: {len(memory)}**")
             st.divider()
             
-            # Memory preview
+            # Memory preview with confidence
             rows = []
             for m in memory:
+                conf = m.get("confidence", 0.0)
+                if conf > 0.8:
+                    conf_label = "🟢"
+                elif conf >= 0.5:
+                    conf_label = "🟡"
+                else:
+                    conf_label = "🔴"
+
                 rows.append({
-                    "Q": m.get("question", ""),
-                    "Time": m.get("timestamp", "")[:10],
+                    "Q": m.get("question", "")[:80] + ("..." if len(m.get("question", "")) > 80 else ""),
+                    "Confidence": f"{conf_label} {conf:.2f}",
+                    "Date": m.get("timestamp", "")[:10],
                 })
             st.dataframe(rows, use_container_width='stretch')
             
@@ -250,7 +281,27 @@ def main():
                 with st.expander(f"Q: {m.get('question', '')}"):
                     st.write("**Answer:**")
                     st.write(m.get("answer", ""))
-                    st.caption(f"{m.get('timestamp', '')}")
+
+                    # Display confidence
+                    conf = m.get("confidence", 0.0)
+                    if conf > 0.8:
+                        conf_label = "🟢 High"
+                    elif conf >= 0.5:
+                        conf_label = "🟡 Medium"
+                    else:
+                        conf_label = "🔴 Low"
+
+                    timestamp = m.get("timestamp", "")
+
+                    # Display confidence, timestamp, and flags
+                    flags = m.get("flags", [])
+                    caption_parts = [f"Confidence: **{conf:.2f}** ({conf_label})", f"Answered: {timestamp[:19] if timestamp else 'Unknown'}"]
+                    if flags and len(flags) > 0:
+                        flags_str = ", ".join(flags)
+                        caption_parts.append(f"⚠️ Flags: {flags_str}")
+                    st.caption(" | ".join(caption_parts))
+
+                    # Display sources if available
                     if m.get("provenance"):
                         st.write("**Sources:**")
                         for p in m["provenance"]:
