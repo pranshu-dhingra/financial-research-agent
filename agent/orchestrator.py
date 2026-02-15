@@ -246,6 +246,8 @@ def run_workflow(question: str, pdf_path: str, use_streaming: bool = True) -> di
             "partials": partials,
             "model_id": "orchestrator",
             "embedding": embedding,
+            "confidence": verification["confidence"],
+            "flags": verification["flags"],
         }
         append_memory_for_pdf(entry, pdf_path)
     
